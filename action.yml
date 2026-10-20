@@ -41,6 +41,9 @@ inputs:
   allow-forks:
     description: Set to "true" to review pull requests from forks. Their code is only read, never run.
     default: "false"
+  authors:
+    description: Whose pull requests a pull request event reviews. "writers" (the default) reviews only those whose author can push to the repository. "any" reviews every author's, for a workflow that decides itself which pull requests to review, such as one started by pull_request_target. A comment or a manual run always needs a person with write access.
+    default: writers
 
 runs:
   using: composite
@@ -61,6 +64,7 @@ runs:
         INPUT_NUMBER: ${{ inputs.pr-number }}
         COMMAND: ${{ inputs.command }}
         ALLOW_FORKS: ${{ inputs.allow-forks }}
+        AUTHORS: ${{ inputs.authors }}
       run: |
         set -euo pipefail
         skip() { echo "::notice::No review: $1"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; }
@@ -74,8 +78,15 @@ runs:
         case "$number" in ''|*[!0-9]*) echo "::error::No pull request number. Set pr-number."; exit 1 ;; esac
 
         # Only people who can push to the repository may start a review, because each one costs money.
-        permission=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2>/dev/null || echo none)
-        case "$permission" in admin|write) ;; *) skip "$ACTOR does not have write access to $REPO" ;; esac
+        # A pull request event with authors set to "any" was chosen by the workflow, which gates it itself.
+        case "$AUTHORS" in writers|any) ;; *) echo "::error::authors must be writers or any."; exit 1 ;; esac
+        case "$EVENT_NAME:$AUTHORS" in
+          pull_request:any|pull_request_target:any) ;;
+          *)
+            permission=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2>/dev/null || echo none)
+            case "$permission" in admin|write) ;; *) skip "$ACTOR does not have write access to $REPO" ;; esac
+            ;;
+        esac
 
         mkdir -p "$RUNNER_TEMP/rev-engine-prime/pr" "$RUNNER_TEMP/rev-engine-prime/out"
         gh api "repos/$REPO/pulls/$number" > "$RUNNER_TEMP/rev-engine-prime/pull.json"
