@@ -139,14 +139,21 @@ test("a call that thinks leaves the tool to the model, one that doesn't is force
   assert.deepEqual(bodies[1]!.messages[1].content[0], { type: "thinking", thinking: "", signature: "s1" });
 });
 
-test("a reply that thought unasked keeps its thinking for the next request", async () => {
-  const fetchImpl = (async () => new Response(JSON.stringify({
-    content: [{ type: "thinking", thinking: "Unasked.", signature: "u1" }, { type: "text", text: "Done." }],
-    usage: {},
-  }))) as unknown as typeof fetch;
+test("a reply that thought unasked sends its thinking back with the next request", async () => {
+  const bodies: Array<Record<string, any>> = [];
+  const fetchImpl = (async (_url: string, init: { body: string }) => {
+    bodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      content: [{ type: "thinking", thinking: "Unasked.", signature: "u1" }, { type: "text", text: "Done." }],
+      usage: {},
+    }));
+  }) as unknown as typeof fetch;
   const chat = createChat({ apiKey: "grant", baseUrl: "https://example.test", api: "anthropic", effort: null, usage: emptyUsage(), fetchImpl });
-  const reply = await chat({ model: "claude-test", tools: [], timeoutMs: 5_000, messages: [{ role: "user", content: "Review." }] });
-  assert.deepEqual(reply.reasoning_details, [{ type: "thinking", thinking: "Unasked.", signature: "u1" }]);
+  const first = { role: "user" as const, content: "Review." };
+  const reply = await chat({ model: "claude-test", tools: [], timeoutMs: 5_000, messages: [first] });
+  await chat({ model: "claude-test", tools: [], timeoutMs: 5_000, messages: [first, reply, { role: "user", content: "Go on." }] });
+  assert.equal(bodies[1]!.thinking, undefined);
+  assert.deepEqual(bodies[1]!.messages[1].content[0], { type: "thinking", thinking: "Unasked.", signature: "u1" });
 });
 
 test("a model that refuses a forced tool choice is asked again, and from then on, with the choice left to it", async () => {

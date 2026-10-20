@@ -1,6 +1,7 @@
 # One review workflow for many repositories, each of which calls it from a short workflow of its
 # own, such as this repository's review.yml. It reviews a pull request when it's opened, reopened
-# or marked ready, and again when a person with write access comments /review.
+# or marked ready, if its author's association is in at-open, and whenever a person with write
+# access comments /review.
 #
 # The runner joins a private tailnet for the length of the job, as an ephemeral device tagged
 # tag:ci, through Tailscale's workload identity federation, and reviews through a model
@@ -34,12 +35,16 @@ jobs:
   review:
     if: >-
       (github.event_name == 'pull_request_target' && !github.event.pull_request.draft &&
+       contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action) &&
        contains(fromJSON(inputs.at-open), github.event.pull_request.author_association)) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
        (startsWith(github.event.comment.body, '/review ') || github.event.comment.body == '/review')) ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Runs for one pull request queue rather than overlap. The comment gate above keeps a stranger's
+    # /review out of the queue, where it would replace a pending review.
     concurrency:
       group: rev-engine-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr-number }}
     steps:
@@ -55,7 +60,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "$EVENT_NAME" = pull_request_target ]; then echo "allowed=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          permission=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2>/dev/null || echo none)
+          # A failed lookup fails the run, rather than passing for "no write access".
+          permission=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission)
           case "$permission" in
             admin|write) echo "allowed=true" >> "$GITHUB_OUTPUT" ;;
             *) echo "::notice::No review: $ACTOR does not have write access to $REPO" ;;

@@ -50,7 +50,7 @@ On a later review of the same pull request, the action first collects what the m
 | `time-budget` | `780` | Seconds allowed for the review. |
 | `command` | `/review` | A comment starts a review only when it is this text, or this text followed by a space. |
 | `allow-forks` | `false` | Set to `true` to review pull requests from forks. |
-| `authors` | `writers` | Whose pull requests a pull request event reviews: `writers`, those whose author can push to the repository, or `any`, for a workflow that chooses itself which pull requests to review. A comment or a manual run always needs a person with write access. |
+| `authors` | `writers` | Which pull request events start a review: with `writers`, only those raised by someone who can push to the repository, such as its opening or reopening; with `any`, every one, for a workflow that chooses itself which pull requests to review. A comment or a manual run always needs a person with write access. |
 | `model-base-url` | none | Where model requests go instead of OpenRouter, as `RB_MODEL_BASE_URL` in [Settings](SETTINGS.md). The review container then shares the runner's network, so it reaches the endpoint the way the runner does. |
 | `model-api` | `chat` | The API the endpoint at `model-base-url` speaks: `chat` or `anthropic`. |
 | `model-api-key` | none | The key for the endpoint at `model-base-url`, in place of `openrouter-api-key`. That endpoint gets no other key. |

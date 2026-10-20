@@ -3,7 +3,7 @@ description: Reviews a pull request with a model when a maintainer asks, and pos
 
 inputs:
   openrouter-api-key:
-    description: OpenRouter API key. Pass it from a repository secret. Needed unless model-api-key is set.
+    description: OpenRouter API key. Pass it from a repository secret. Needed unless model-api-key is set, and not passed to the review when model-base-url is set.
     default: ""
   model-base-url:
     description: Where model requests go, when not OpenRouter, as RB_MODEL_BASE_URL in docs/SETTINGS.md. The review container then shares the runner's network, so it reaches the endpoint the way the runner does.
@@ -42,7 +42,7 @@ inputs:
     description: Set to "true" to review pull requests from forks. Their code is only read, never run.
     default: "false"
   authors:
-    description: Whose pull requests a pull request event reviews. "writers" (the default) reviews only those whose author can push to the repository. "any" reviews every author's, for a workflow that decides itself which pull requests to review, such as one started by pull_request_target. A comment or a manual run always needs a person with write access.
+    description: Which pull request events start a review. "writers" (the default) needs the person whose action raised the event, such as opening or reopening the pull request, to be able to push to the repository. "any" reviews whoever raised it, for a workflow that decides itself which pull requests to review, such as one started by pull_request_target. A comment or a manual run always needs a person with write access.
     default: writers
 
 runs:

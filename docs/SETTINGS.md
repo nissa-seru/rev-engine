@@ -13,7 +13,7 @@ The model endpoint can be another one, such as a gateway of your own:
 
 With `anthropic`, the run reports tokens but no cost, since the Messages API returns none. `RB_CONFIG_EFFORT` turns on adaptive thinking at that effort. The API allows thinking or a forced tool choice, not both, so a call that thinks leaves the choice of tool to the model, and the prompt asks for the tool in words. A model that refuses a forced tool choice is left to choose for the rest of the run.
 
-The scripts in `scripts/` and the evals read the same settings. The evals and the TypeScript scripts take each one from the shell when it is set and not empty, or else from `.env`. `scripts/local-run.sh` and `scripts/score.sh` source `.env` over the shell, so there a value in `.env` wins. With `anthropic`, `scripts/score.sh` judges with the endpoint too, by default with Claude Sonnet 5, the leaderboard's judge. Its judge reaches the endpoint through `scripts/stream-shim.ts`, since ReviewBench's judging CLI streams every request and an endpoint may answer only whole.
+The scripts in `scripts/` and the evals read the same settings. The evals and the TypeScript scripts take each one from the shell when it is set and not empty, or else from `.env`. `scripts/local-run.sh` and `scripts/score.sh` source `.env` over the shell, so there a value in `.env` wins. With `anthropic`, `scripts/score.sh` judges with the endpoint too, unless `JUDGE_PROVIDER` is `openrouter`, by default with Claude Sonnet 5, the leaderboard's judge. Its judge reaches the endpoint through `scripts/stream-shim.ts`, since ReviewBench's judging CLI streams every request and an endpoint may answer only whole.
 
 If you use the GitHub Action, set its inputs instead. They are listed in [INSTALL.md](INSTALL.md).
 
