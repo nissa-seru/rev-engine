@@ -3,12 +3,12 @@
 //
 //   node scripts/stream-shim.ts <url-file>
 //
-// ReviewBench's judging CLI streams every model request. When RB_MODEL_API is anthropic,
-// scripts/score.sh starts this and points the judge at it. It listens on loopback, sends
+// ReviewBench's judging CLI streams every model request. When RB_MODEL_API is anthropic and
+// the judge's provider isn't openrouter, scripts/score.sh starts this and points the judge at it. It listens on loopback, sends
 // each request on to RB_MODEL_BASE_URL without `stream`, and plays the whole answer back
 // as the events the Messages API streams. Requests that don't stream, and answers that
 // aren't a success, pass through unchanged. The judge's own key and headers go on with
-// each request, with RB_MODEL_HEADERS added. Once it listens, it writes its base URL to
+// each request, with RB_MODEL_HEADERS added where the judge sent no header of that name. Once it listens, it writes its base URL to
 // <url-file>, and it runs until it is stopped.
 import { writeFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders } from "node:http";
@@ -22,15 +22,18 @@ if (!urlFile) throw new Error("usage: node scripts/stream-shim.ts <url-file>");
 const endpoint = readEndpoint(here);
 if (endpoint.api !== "anthropic") throw new Error("stream-shim serves only RB_MODEL_API=anthropic");
 
-/** Headers that belong to one connection or one encoding of a body, which each side sets for its own. */
-const HOP = new Set(["host", "connection", "keep-alive", "content-length", "transfer-encoding", "accept-encoding", "content-encoding"]);
+/** Headers that belong to one connection, which each side sets for its own. */
+const HOP = new Set(["host", "connection", "keep-alive", "content-length", "transfer-encoding", "accept-encoding"]);
+/** An answer's headers that don't survive fetch decoding its body. */
+const DECODED = new Set([...HOP, "content-encoding"]);
 
 function forwarded(headers: IncomingHttpHeaders): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [name, value] of Object.entries(headers)) {
     if (!HOP.has(name) && value !== undefined) out[name] = Array.isArray(value) ? value.join(", ") : value;
   }
-  return { ...out, ...endpoint.headers };
+  // The judge's own headers win, as the reviewer's client's own do.
+  return { ...endpoint.headers, ...out };
 }
 
 type Block = Record<string, any>;
@@ -86,12 +89,16 @@ const server = createServer(async (request, response) => {
     const text = await upstream.text();
     if (!streamed || !upstream.ok) {
       // As it came, retry-after and the like included; fetch has already decoded the body.
-      response.writeHead(upstream.status, [...upstream.headers].filter(([name]) => !HOP.has(name)).flat());
+      response.writeHead(upstream.status, [...upstream.headers].filter(([name]) => !DECODED.has(name)).flat());
       response.end(text);
       return;
     }
     // Built whole before the head is sent, so an answer that isn't a message still gets an error status.
-    const stream = [...events(JSON.parse(text))].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
+    const message: unknown = JSON.parse(text);
+    if (!message || typeof message !== "object" || !Array.isArray((message as { content?: unknown }).content)) {
+      throw new Error("the endpoint's answer isn't a Messages message");
+    }
+    const stream = [...events(message as Record<string, any>)].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
     response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
     response.end(stream);
   } catch (error) {

@@ -164,7 +164,7 @@ async function probe(miss: Miss, messages: ChatMessage[], model: string, head: s
     for (const other of reply.tool_calls ?? []) messages.push({ role: "tool", tool_call_id: other.id, content: "No more files can be opened. Answer from what you have read." });
     messages.push({ role: "user", content: "Answer with answer_probe now, from what you have already read." });
   }
-  // Null when the judge answered without its tool, which a model left to choose can do.
+  // Null when the judge gave no yes or no: no tool call, which a model left to choose can make, or no same_problem.
   let same: boolean | null = false;
   if (answer?.problem_found && answer.problem) {
     const verdict = await chat({
@@ -175,7 +175,8 @@ async function probe(miss: Miss, messages: ChatMessage[], model: string, head: s
       ],
     });
     const verdictCall = verdict.tool_calls?.find((item) => item.function.name === submitMatch.function.name);
-    same = verdictCall ? Boolean(JSON.parse(verdictCall.function.arguments).same_problem) : null;
+    const verdictValue: unknown = verdictCall ? JSON.parse(verdictCall.function.arguments).same_problem : null;
+    same = typeof verdictValue === "boolean" ? verdictValue : null;
   }
   const outcome = !answer ? "no answer" : !answer.problem_found ? "not found" : same === null ? "no verdict" : same ? "found" : "other";
   return { ...miss, outcome, answer };

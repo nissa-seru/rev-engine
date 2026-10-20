@@ -112,7 +112,7 @@ test("speaks Anthropic Messages: system, tools, tool results, caching, and the r
 
 const SUBMIT = { type: "function" as const, function: { name: "submit", description: "Hand in the answer.", parameters: { type: "object", properties: {} } } };
 
-test("a call that thinks leaves the tool to the model and keeps earlier thinking, and one that doesn't is forced", async () => {
+test("a call that thinks leaves the tool to the model, one that doesn't is forced, and both keep earlier thinking", async () => {
   const bodies: Array<Record<string, any>> = [];
   const fetchImpl = (async (_url: string, init: { body: string }) => {
     bodies.push(JSON.parse(init.body));
@@ -135,7 +135,8 @@ test("a call that thinks leaves the tool to the model and keeps earlier thinking
   assert.deepEqual(bodies[1]!.tool_choice, { type: "tool", name: "submit" });
   assert.equal(bodies[1]!.thinking, undefined);
   assert.equal(bodies[1]!.output_config, undefined);
-  assert.deepEqual(bodies[1]!.messages[1], { role: "assistant", content: [{ type: "text", text: "Done reading." }] });
+  // Thinking a reply carried goes back whatever this call's effort, since a model may think unasked.
+  assert.deepEqual(bodies[1]!.messages[1].content[0], { type: "thinking", thinking: "", signature: "s1" });
 });
 
 test("a model that refuses a forced tool choice is asked again, and from then on, with the choice left to it", async () => {
@@ -146,6 +147,9 @@ test("a model that refuses a forced tool choice is asked again, and from then on
     const refuse = (message: string) => new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 400 });
     if (body.model === "claude-refuses" && body.tool_choice.type === "tool") return refuse("tool_choice: type \"tool\" and \"any\" are not supported for this model.");
     if (body.model === "claude-unknown-tool" && body.tool_choice.type === "tool") return refuse("tool_choice.name: no tool named submit");
+    if (body.model === "claude-422" && body.tool_choice.type === "tool") {
+      return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "tool_choice: type \"tool\" is not supported here, 422" } }), { status: 422 });
+    }
     return new Response(JSON.stringify({ content: [{ type: "tool_use", id: "toolu_1", name: "submit", input: {} }], usage: {} }));
   }) as unknown as typeof fetch;
   const chat = createChat({ apiKey: "grant", baseUrl: "https://example.test", api: "anthropic", effort: null, usage: emptyUsage(), fetchImpl });
@@ -163,6 +167,8 @@ test("a model that refuses a forced tool choice is asked again, and from then on
   // Another 400 about the tool choice is the caller's to handle, and the model stays forced.
   await assert.rejects(chat({ ...request, model: "claude-unknown-tool" }), /no tool named submit/);
   await assert.rejects(chat({ ...request, model: "claude-unknown-tool" }), /no tool named submit/);
+  // A refusal is a 400; the same words with another status are the caller's too.
+  await assert.rejects(chat({ ...request, model: "claude-422" }), /422/);
 });
 
 test("only Anthropic's own thinking blocks go back to Anthropic Messages", () => {
@@ -170,7 +176,7 @@ test("only Anthropic's own thinking blocks go back to Anthropic Messages", () =>
     { role: "user", content: "Review." },
     { role: "assistant", content: "Done.", reasoning_details: [{ type: "reasoning.text", text: "another provider's" }, { type: "thinking", thinking: "", signature: "s1" }, { type: "redacted_thinking", data: "r1" }] },
     { role: "user", content: "Again." },
-  ], true);
+  ]);
   assert.deepEqual(messages[1], { role: "assistant", content: [{ type: "thinking", thinking: "", signature: "s1" }, { type: "redacted_thinking", data: "r1" }, { type: "text", text: "Done." }] });
 });
 
@@ -180,9 +186,13 @@ test("an empty assistant turn is left out, and tool arguments that aren't an obj
     { role: "assistant", content: null },
     { role: "user", content: "Continue." },
     { role: "assistant", content: null, tool_calls: [{ id: "toolu_1", type: "function", function: { name: "submit", arguments: "{\"findings\": [" } }] },
-  ], false);
+    { role: "user", content: "Once more." },
+    { role: "assistant", content: null, tool_calls: [{ id: "toolu_2", type: "function", function: { name: "submit", arguments: "[1]" } }] },
+  ]);
   assert.deepEqual(messages, [
     { role: "user", content: [{ type: "text", text: "Review." }, { type: "text", text: "Continue." }] },
-    { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "submit", input: { input: "{\"findings\": [" }, cache_control: { type: "ephemeral" } }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "submit", input: { input: "{\"findings\": [" } }] },
+    { role: "user", content: [{ type: "text", text: "Once more." }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_2", name: "submit", input: { input: "[1]" }, cache_control: { type: "ephemeral" } }] },
   ]);
 });

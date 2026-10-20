@@ -128,5 +128,6 @@ test("reads the endpoint from the environment where it is set and not empty, and
   const dir = mkdtempSync(join(tmpdir(), "rep-env-"));
   writeFileSync(join(dir, ".env"), "RB_MODEL_API_KEY=from-file\nRB_MODEL_BASE_URL=https://file.example/v1\n");
   assert.deepEqual(readEndpoint(dir, { RB_MODEL_API_KEY: "", RB_MODEL_BASE_URL: "https://shell.example/v1" }), { apiKey: "from-file", baseUrl: "https://shell.example/v1", api: "chat", headers: {} });
+  assert.equal(readEndpoint(dir, { RB_MODEL_API_KEY: "  " }).apiKey, "from-file");
   assert.equal(readEndpoint(join(dir, "missing"), { OPENROUTER_API_KEY: "shell" }).apiKey, "shell");
 });

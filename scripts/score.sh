@@ -25,13 +25,9 @@ run="$here/runs/$1"
 [ -d "$run/findings" ] || { echo "no findings in $run" >&2; exit 2; }
 
 if [ -f "$here/.env" ]; then set -a; . "$here/.env"; set +a; fi
-if [ "${RB_MODEL_API:-chat}" = anthropic ]; then
-  provider="${JUDGE_PROVIDER:-model-endpoint}"
-  model="${JUDGE_MODEL:-claude-sonnet-5}"
-else
-  provider="${JUDGE_PROVIDER:-openrouter}"
-  model="${JUDGE_MODEL:-google/gemini-3.5-flash}"
-fi
+if [ "${RB_MODEL_API:-chat}" = anthropic ]; then provider="${JUDGE_PROVIDER:-model-endpoint}"; else provider="${JUDGE_PROVIDER:-openrouter}"; fi
+# The default model follows the judge's provider, which an anthropic endpoint can leave at openrouter.
+if [ "$provider" = openrouter ]; then model="${JUDGE_MODEL:-google/gemini-3.5-flash}"; else model="${JUDGE_MODEL:-claude-sonnet-5}"; fi
 out="$run/${SCORING_NAME:-scoring}"
 mkdir -p "$out"
 

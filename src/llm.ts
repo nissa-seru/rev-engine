@@ -179,15 +179,14 @@ export function createChat(options: ClientOptions): Chat {
   async function messages(request: ChatRequest, timeoutMs: number, refused = false): Promise<ChatMessage> {
     const started = Date.now();
     const effort = request.effort ?? options.effort;
-    // The API allows thinking or a forced tool choice, not both. Thinking wins, since a call
-    // that stopped thinking partway through a tool loop would have to leave out the thinking
-    // blocks the loop's earlier turns carry.
+    // The API allows thinking or a forced tool choice, not both. Thinking wins, since the API
+    // also doesn't let thinking be switched off partway through a tool loop.
     const thinking = Boolean(effort);
     const force = request.forceTool && !thinking && !refused && !unforced.has(request.model) ? request.forceTool : null;
     const body: Record<string, unknown> = {
       model: request.model,
       max_tokens: MAX_OUTPUT_TOKENS,
-      ...toAnthropic(request.messages, thinking),
+      ...toAnthropic(request.messages),
       tools: request.tools.map((tool) => ({ name: tool.function.name, description: tool.function.description, input_schema: tool.function.parameters })),
       tool_choice: force ? { type: "tool", name: force } : { type: "auto" },
     };
@@ -224,7 +223,8 @@ export function createChat(options: ClientOptions): Chat {
         function: { name: String(block.name ?? ""), arguments: JSON.stringify(block.input ?? {}) },
       }));
     }
-    // Thinking goes back unchanged on the next turn, which a tool loop with thinking requires.
+    // Thinking goes back unchanged on later turns, which a tool loop with thinking requires.
+    // A model may think when the request doesn't ask it to, so this holds whatever the effort.
     const reasoning = blocks.filter((block) => block.type === "thinking" || block.type === "redacted_thinking");
     if (reasoning.length) result.reasoning_details = reasoning;
     return result;
@@ -253,11 +253,11 @@ type AnthropicBlock = Record<string, unknown>;
 /**
  * Turns a chat-completions conversation into an Anthropic Messages `system` and `messages`.
  * System messages become the system prompt. Tool results become `tool_result` blocks in a user
- * turn, and turns of one role in a row are joined, since the API alternates roles. Thinking
- * blocks a reply carried go back first in its turn, and are left out of a call that doesn't think.
+ * turn, and turns of one role in a row are joined, since the API alternates roles. Anthropic
+ * thinking blocks a reply carried go back first in its turn, whether or not this call thinks.
  * The last block is marked for caching, so each turn reads the conversation so far from the cache.
  */
-export function toAnthropic(messages: ChatMessage[], thinking: boolean): { system?: string; messages: Array<{ role: "user" | "assistant"; content: AnthropicBlock[] }> } {
+export function toAnthropic(messages: ChatMessage[]): { system?: string; messages: Array<{ role: "user" | "assistant"; content: AnthropicBlock[] }> } {
   const system = messages.filter((message) => message.role === "system").map((message) => message.content ?? "").filter(Boolean).join("\n\n");
   const turns: Array<{ role: "user" | "assistant"; content: AnthropicBlock[] }> = [];
   const add = (role: "user" | "assistant", blocks: AnthropicBlock[]): void => {
@@ -271,7 +271,7 @@ export function toAnthropic(messages: ChatMessage[], thinking: boolean): { syste
     else if (message.role === "tool") add("user", [{ type: "tool_result", tool_use_id: message.tool_call_id ?? "", content: message.content ?? "" }]);
     else if (message.role === "assistant") {
       // Only Anthropic's own thinking blocks go back: a recorded conversation may carry another provider's reasoning.
-      const reasoning = thinking && Array.isArray(message.reasoning_details)
+      const reasoning = Array.isArray(message.reasoning_details)
         ? (message.reasoning_details as AnthropicBlock[]).filter((block) => block?.type === "thinking" || block?.type === "redacted_thinking")
         : [];
       add("assistant", [
