@@ -1,6 +1,6 @@
 # Settings
 
-The reviewer container reads its settings from environment variables. It needs one credential, `OPENROUTER_API_KEY` (or `RB_MODEL_API_KEY`, below), and reaches one host, the one in `RB_MODEL_BASE_URL` (`https://openrouter.ai/api/v1` by default). The `RB_` names come from the [ReviewBench agent contract](https://github.com/review-bench/ReviewBench/blob/main/AGENT_CONTRACT.md).
+The reviewer container reads its settings from environment variables. It needs a single credential, `OPENROUTER_API_KEY` (or `RB_MODEL_API_KEY`, below), and reaches one host, the one in `RB_MODEL_BASE_URL` (`https://openrouter.ai/api/v1` by default). The `RB_` names come from the [ReviewBench agent contract](https://github.com/review-bench/ReviewBench/blob/main/AGENT_CONTRACT.md).
 
 The model endpoint can be another one, such as a gateway of your own:
 
