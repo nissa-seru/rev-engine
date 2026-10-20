@@ -14,6 +14,7 @@
 //   found      pointed at the lines, the reviewer names the expected problem
 //   other      it names a different problem in those lines
 //   not found  it sees no problem there
+//   no verdict it names a problem, and the judge answered without saying whether it matches
 //
 // A miss it finds when pointed at was within reach: the reviewer had what it needed
 // and did not notice or chose not to report. The reasons it gives are its own account,
@@ -26,12 +27,11 @@ import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
-import { loadEndpoint, parseEnvFile } from "../src/config.ts";
+import { readEndpoint } from "../src/config.ts";
 import { createChat, emptyUsage, type ChatMessage, type Usage } from "../src/llm.ts";
 import { readTools, type ToolDefinition } from "../src/tools.ts";
 
 const here = resolve(import.meta.dirname, "..");
-const JUDGE_MODEL = process.env.JUDGE_MODEL ?? "google/gemini-3.5-flash";
 const TIMEOUT_MS = 300_000;
 const MAX_QUOTED_LINES = 60;
 const run = promisify(execFile);
@@ -50,8 +50,10 @@ const keys = option("--keys")?.split(",") ?? null;
 const levels = (option("--levels") ?? "opened,diff,file,none").split(",");
 const runDir = join(here, "runs", name);
 
-// The model endpoint's settings, from the shell or else .env, as for scripts/local-run.sh (docs/SETTINGS.md).
-const endpoint = loadEndpoint({ ...parseEnvFile(await readFile(join(here, ".env"), "utf8").catch(() => "")), ...process.env });
+// The model endpoint (docs/SETTINGS.md): each setting from the shell when it is set, or else from .env.
+const endpoint = readEndpoint(here);
+// The judge, as for scripts/score.sh: Gemini 3.5 Flash on OpenRouter, Claude Sonnet 5 on an Anthropic endpoint.
+const JUDGE_MODEL = process.env.JUDGE_MODEL ?? (endpoint.api === "anthropic" ? "claude-sonnet-5" : "google/gemini-3.5-flash");
 const usage = emptyUsage();
 const byCaller = new Map<string, Usage>();
 const chat = createChat({ ...endpoint, effort: null, usage, usageByCaller: byCaller });
@@ -162,19 +164,20 @@ async function probe(miss: Miss, messages: ChatMessage[], model: string, head: s
     for (const other of reply.tool_calls ?? []) messages.push({ role: "tool", tool_call_id: other.id, content: "No more files can be opened. Answer from what you have read." });
     messages.push({ role: "user", content: "Answer with answer_probe now, from what you have already read." });
   }
-  let same = false;
+  // Null when the judge answered without its tool, which a model left to choose can do.
+  let same: boolean | null = false;
   if (answer?.problem_found && answer.problem) {
     const verdict = await chat({
       model: JUDGE_MODEL, timeoutMs: TIMEOUT_MS, caller: "judge", tools: [submitMatch], forceTool: submitMatch.function.name,
       messages: [
-        { role: "system", content: "You compare two descriptions of a problem in code review and say whether they describe the same underlying problem." },
+        { role: "system", content: "You compare two descriptions of a problem in code review and say whether they describe the same underlying problem. Answer by calling submit_match." },
         { role: "user", content: `Expected problem at ${miss.file}:${miss.start}-${miss.end}:\n${miss.message}\n\nThe reviewer's answer:\n${answer.problem}` },
       ],
     });
     const verdictCall = verdict.tool_calls?.find((item) => item.function.name === submitMatch.function.name);
-    same = verdictCall ? Boolean(JSON.parse(verdictCall.function.arguments).same_problem) : false;
+    same = verdictCall ? Boolean(JSON.parse(verdictCall.function.arguments).same_problem) : null;
   }
-  const outcome = !answer ? "no answer" : !answer.problem_found ? "not found" : same ? "found" : "other";
+  const outcome = !answer ? "no answer" : !answer.problem_found ? "not found" : same === null ? "no verdict" : same ? "found" : "other";
   return { ...miss, outcome, answer };
 }
 
@@ -200,7 +203,7 @@ await Promise.all([...byKey].map(async ([key, group]) => {
 
 await writeFile(join(runDir, "probes.json"), `${JSON.stringify(results, null, 2)}\n`);
 const cell = (text: string) => text.replace(/\s+/g, " ").replaceAll("|", "\\|");
-const outcomes = ["found", "other", "not found", "no answer"];
+const outcomes = ["found", "other", "not found", "no answer", "no verdict"];
 const crossTable = (title: string, values: string[], group: (result: typeof results[number]) => string) => [
   `| ${title} | ${outcomes.join(" | ")} | All |`,
   `|---|${outcomes.map(() => "---|").join("")}---|`,

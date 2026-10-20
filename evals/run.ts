@@ -13,7 +13,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Finding } from "../action/comments.ts";
-import { loadEndpoint, parseEnvFile, type Endpoint } from "../src/config.ts";
+import { readEndpoint, type Endpoint } from "../src/config.ts";
 import { createChat, emptyUsage } from "../src/llm.ts";
 import type { ToolDefinition } from "../src/tools.ts";
 import { parseCase, renderReport, scoreCase, withEarlierDecisions, type EvalCase, type RunResult } from "./lib.ts";
@@ -212,8 +212,8 @@ async function pool(jobs: Array<() => Promise<void>>, width: number): Promise<vo
 const options = parseArguments(process.argv.slice(2));
 const cases = await loadCases(options.cases, options.split);
 if (!cases.length) throw new Error("no eval cases found in evals/cases or evals/private");
-// The model endpoint the reviews and the matching use: each setting from the environment, or else from .env.
-const endpoint = loadEndpoint({ ...parseEnvFile(await readFile(join(root, ".env"), "utf8").catch(() => "")), ...process.env });
+// The model endpoint the reviews and the matching use (docs/SETTINGS.md): each setting from the shell when it is set, or else from .env.
+const endpoint = readEndpoint(root);
 const runRoot = join(root, "runs/evals", options.name);
 const say = (message: string): void => console.error(`eval: ${message}`);
 

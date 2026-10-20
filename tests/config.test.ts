@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEFAULT_BASE_URL, DEFAULT_MODEL, describeSettings, loadConfig, loadEndpoint, parseEnvFile } from "../src/config.ts";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DEFAULT_BASE_URL, DEFAULT_MODEL, describeSettings, loadConfig, loadEndpoint, parseEnvFile, readEndpoint } from "../src/config.ts";
 
 const BASE = {
   RB_NWO: "owner/repo",
@@ -102,19 +105,28 @@ test("reads the model API and a key that is not OpenRouter's", () => {
   assert.equal(loadConfig({ ...BASE, RB_MODEL_API_KEY: "other-key" }).apiKey, "other-key");
   assert.throws(() => loadConfig({ ...BASE, RB_MODEL_API: "responses" }), /RB_MODEL_API must be chat or anthropic/);
   assert.throws(() => loadConfig(withoutOpenRouter), /missing OPENROUTER_API_KEY, or RB_MODEL_API_KEY/);
+  // OpenRouter's URL isn't a default for another API, so an endpoint's key never goes there unasked.
+  assert.throws(() => loadConfig({ ...BASE, RB_MODEL_API: "anthropic" }), /RB_MODEL_API=anthropic needs RB_MODEL_BASE_URL/);
 });
 
 test("reads extra model request headers as a JSON object", () => {
   assert.deepEqual(loadConfig(BASE).headers, {});
-  assert.deepEqual(loadConfig({ ...BASE, RB_MODEL_HEADERS: '{"x-class":"batch"}' }).headers, { "x-class": "batch" });
-  for (const bad of ["x-class: batch", '["x"]', '{"x-count":1}']) {
+  assert.deepEqual(loadConfig({ ...BASE, RB_MODEL_HEADERS: '{"X-Class":"batch"}' }).headers, { "x-class": "batch" });
+  for (const bad of ["x-class: batch", '["x"]', '{"x-count":1}', "1", "null", '"x"']) {
     assert.throws(() => loadConfig({ ...BASE, RB_MODEL_HEADERS: bad }), /RB_MODEL_HEADERS must be a JSON object/, bad);
   }
 });
 
 test("reads a .env file's settings, taking one pair of quotes off a value", () => {
-  const text = "# a comment\nRB_MODEL_API=anthropic\nRB_MODEL_HEADERS='{\"x-class\":\"batch\"}'\nOPENROUTER_API_KEY=\"quoted\"\nnot a setting\n";
+  const text = "# a comment\nRB_MODEL_API=anthropic\nexport RB_MODEL_BASE_URL=http://127.0.0.1:9/anthropic\nRB_MODEL_HEADERS='{\"x-class\":\"batch\"}'\nOPENROUTER_API_KEY=\"quoted\"\nnot a setting\n";
   const settings = parseEnvFile(text);
-  assert.deepEqual(settings, { RB_MODEL_API: "anthropic", RB_MODEL_HEADERS: '{"x-class":"batch"}', OPENROUTER_API_KEY: "quoted" });
-  assert.deepEqual(loadEndpoint(settings), { apiKey: "quoted", baseUrl: DEFAULT_BASE_URL, api: "anthropic", headers: { "x-class": "batch" } });
+  assert.deepEqual(settings, { RB_MODEL_API: "anthropic", RB_MODEL_BASE_URL: "http://127.0.0.1:9/anthropic", RB_MODEL_HEADERS: '{"x-class":"batch"}', OPENROUTER_API_KEY: "quoted" });
+  assert.deepEqual(loadEndpoint(settings), { apiKey: "quoted", baseUrl: "http://127.0.0.1:9/anthropic", api: "anthropic", headers: { "x-class": "batch" } });
+});
+
+test("reads the endpoint from the environment where it is set and not empty, and from .env otherwise", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rep-env-"));
+  writeFileSync(join(dir, ".env"), "RB_MODEL_API_KEY=from-file\nRB_MODEL_BASE_URL=https://file.example/v1\n");
+  assert.deepEqual(readEndpoint(dir, { RB_MODEL_API_KEY: "", RB_MODEL_BASE_URL: "https://shell.example/v1" }), { apiKey: "from-file", baseUrl: "https://shell.example/v1", api: "chat", headers: {} });
+  assert.equal(readEndpoint(join(dir, "missing"), { OPENROUTER_API_KEY: "shell" }).apiKey, "shell");
 });

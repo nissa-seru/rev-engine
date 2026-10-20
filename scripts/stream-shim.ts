@@ -10,20 +10,20 @@
 // aren't a success, pass through unchanged. The judge's own key and headers go on with
 // each request, with RB_MODEL_HEADERS added. Once it listens, it writes its base URL to
 // <url-file>, and it runs until it is stopped.
-import { writeFile, readFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders } from "node:http";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadEndpoint, parseEnvFile } from "../src/config.ts";
+import { readEndpoint } from "../src/config.ts";
 
 const here = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const urlFile = process.argv[2];
 if (!urlFile) throw new Error("usage: node scripts/stream-shim.ts <url-file>");
-const endpoint = loadEndpoint({ ...parseEnvFile(await readFile(join(here, ".env"), "utf8").catch(() => "")), ...process.env });
+const endpoint = readEndpoint(here);
 if (endpoint.api !== "anthropic") throw new Error("stream-shim serves only RB_MODEL_API=anthropic");
 
-/** Headers that belong to one connection, which fetch sets for its own. */
-const HOP = new Set(["host", "connection", "keep-alive", "content-length", "transfer-encoding", "accept-encoding"]);
+/** Headers that belong to one connection or one encoding of a body, which each side sets for its own. */
+const HOP = new Set(["host", "connection", "keep-alive", "content-length", "transfer-encoding", "accept-encoding", "content-encoding"]);
 
 function forwarded(headers: IncomingHttpHeaders): Record<string, string> {
   const out: Record<string, string> = {};
@@ -85,16 +85,20 @@ const server = createServer(async (request, response) => {
     });
     const text = await upstream.text();
     if (!streamed || !upstream.ok) {
-      response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
+      // As it came, retry-after and the like included; fetch has already decoded the body.
+      response.writeHead(upstream.status, [...upstream.headers].filter(([name]) => !HOP.has(name)).flat());
       response.end(text);
       return;
     }
+    // Built whole before the head is sent, so an answer that isn't a message still gets an error status.
+    const stream = [...events(JSON.parse(text))].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
     response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-    for (const [event, data] of events(JSON.parse(text))) response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    response.end();
+    response.end(stream);
   } catch (error) {
     if (abort.signal.aborted) return;
-    const message = error instanceof Error ? error.message : String(error);
+    // fetch says only "fetch failed"; its cause says why, such as a refused connection or a timeout.
+    const cause = error instanceof Error && error.cause instanceof Error ? `: ${error.cause.message}` : "";
+    const message = `${error instanceof Error ? error.message : String(error)}${cause}`;
     if (!response.headersSent) response.writeHead(502, { "content-type": "application/json" });
     response.end(JSON.stringify({ type: "error", error: { type: "api_error", message: `stream-shim: ${message}` } }));
   }

@@ -1,4 +1,5 @@
 // Reads the agent contract's inputs and this reviewer's settings from the environment.
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Severity } from "./findings.ts";
 import type { ModelApi } from "./llm.ts";
@@ -101,24 +102,45 @@ export function loadEndpoint(env: Env): Endpoint {
   if (!["chat", "anthropic"].includes(api)) throw new Error("RB_MODEL_API must be chat or anthropic");
   const apiKey = env.RB_MODEL_API_KEY?.trim() || env.OPENROUTER_API_KEY?.trim();
   if (!apiKey) throw new Error("missing OPENROUTER_API_KEY, or RB_MODEL_API_KEY");
+  const baseUrl = env.RB_MODEL_BASE_URL?.trim();
+  // OpenRouter's URL is the default only for its own API, so an endpoint's key never goes there by default.
+  if (!baseUrl && api !== "chat") throw new Error(`RB_MODEL_API=${api} needs RB_MODEL_BASE_URL`);
   return {
     apiKey,
-    baseUrl: (env.RB_MODEL_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, ""),
+    baseUrl: (baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, ""),
     api,
     headers: modelHeaders(env.RB_MODEL_HEADERS),
   };
 }
 
-/** NAME=VALUE lines of a .env file, with one pair of surrounding quotes taken off each value. */
+/**
+ * NAME=VALUE lines of a .env file, each optionally after `export`, with one pair of surrounding
+ * quotes taken off each value. Unlike a shell, it keeps a trailing comment as part of the value.
+ */
 export function parseEnvFile(text: string): Record<string, string> {
   const settings: Record<string, string> = {};
-  for (const match of text.matchAll(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/gm)) {
+  for (const match of text.matchAll(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/gm)) {
     settings[match[1]!] = match[2]!.trim().replace(/^(["'])(.*)\1$/, "$2");
   }
   return settings;
 }
 
-/** RB_MODEL_HEADERS: a JSON object of header names and string values. */
+/**
+ * The endpoint as the evals and the scripts on the host read it: each setting from the
+ * environment when it is set and not empty, or else from the .env file in `dir`.
+ */
+export function readEndpoint(dir: string, env: Env = process.env): Endpoint {
+  let text = "";
+  try {
+    text = readFileSync(join(dir, ".env"), "utf8");
+  } catch {
+    // No .env: the environment alone.
+  }
+  const set = Object.fromEntries(Object.entries(env).filter(([, value]) => value?.trim()));
+  return loadEndpoint({ ...parseEnvFile(text), ...set });
+}
+
+/** RB_MODEL_HEADERS: a JSON object of header names and string values. Names come back in lower case, as HTTP compares them. */
 function modelHeaders(raw: string | undefined): Record<string, string> {
   if (!raw?.trim()) return {};
   let value: unknown;
@@ -130,7 +152,7 @@ function modelHeaders(raw: string | undefined): Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.values(value).some((item) => typeof item !== "string")) {
     throw new Error("RB_MODEL_HEADERS must be a JSON object of header names and string values");
   }
-  return value as Record<string, string>;
+  return Object.fromEntries(Object.entries(value).map(([name, item]) => [name.toLowerCase(), item as string]));
 }
 
 export function loadConfig(env: Env): Config {

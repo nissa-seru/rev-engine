@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { runAgent } from "../src/agent.ts";
 import { applyVerdicts, parseVerdicts, rank, toOutput, type Candidate } from "../src/findings.ts";
-import { loadEndpoint, parseEnvFile } from "../src/config.ts";
+import { readEndpoint } from "../src/config.ts";
 import { createChat, emptyUsage, type ChatMessage, type Usage } from "../src/llm.ts";
 import { submitVerdicts, VERIFIER_SYSTEM } from "../src/prompts.ts";
 import { Workspace } from "../src/tools.ts";
@@ -37,8 +37,8 @@ if (!recorded || !target || !model) {
 }
 const jobs = Number(option("--jobs") ?? "5");
 
-// The model endpoint's settings, from the shell or else .env, as for scripts/local-run.sh (docs/SETTINGS.md).
-const endpoint = loadEndpoint({ ...parseEnvFile(await readFile(join(here, ".env"), "utf8").catch(() => "")), ...process.env });
+// The model endpoint (docs/SETTINGS.md): each setting from the shell when it is set, or else from .env.
+const endpoint = readEndpoint(here);
 const usage = emptyUsage();
 const byCaller = new Map<string, Usage>();
 const chat = createChat({ ...endpoint, effort: null, usage, usageByCaller: byCaller });

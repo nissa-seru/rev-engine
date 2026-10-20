@@ -41,7 +41,14 @@ mkdir -p "$run/logs" "$here/runs/.cache/repos" "$run/.try-agent"
 # try-agent.sh runs each container on Docker's default network, which can't reach an
 # endpoint on this machine's loopback, and it has no option for another network. For
 # such an endpoint, the docker it calls runs its containers on the host's network.
-host=$(sed -E 's#^[a-z]+://(\[[^]]*\]|[^/:]+).*#\1#' <<<"${RB_MODEL_BASE_URL:-}")
+# An -e RB_MODEL_BASE_URL=... option names the endpoint the containers get.
+base_url="${RB_MODEL_BASE_URL:-}"
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = -e ]; then case "$arg" in RB_MODEL_BASE_URL=*) base_url="${arg#RB_MODEL_BASE_URL=}" ;; esac; fi
+  previous="$arg"
+done
+host=$(sed -E 's#^[a-z]+://(\[[^]]*\]|[^/:]+).*#\1#' <<<"$base_url")
 case "$host" in
   localhost|127.0.0.1|'[::1]')
     docker="$(command -v docker)"

@@ -20,7 +20,11 @@ export interface ChatRequest {
   model: string;
   messages: ChatMessage[];
   tools: ToolDefinition[];
-  /** A tool name forces that tool; otherwise the model chooses. */
+  /**
+   * A tool name forces that tool; otherwise the model chooses. On Anthropic Messages, a call
+   * that thinks, or a model that refuses a forced choice, is left to choose, so a prompt that
+   * forces a tool should also ask for it in words.
+   */
   forceTool?: string;
   timeoutMs: number;
   /** Names who is asking, such as "s1" or "verifier", so usage can be totalled for each. */
@@ -172,11 +176,14 @@ export function createChat(options: ClientOptions): Chat {
   // Models that refused a forced tool choice. Their forced calls let the model choose instead.
   const unforced = new Set<string>();
 
-  async function messages(request: ChatRequest, timeoutMs: number): Promise<ChatMessage> {
+  async function messages(request: ChatRequest, timeoutMs: number, refused = false): Promise<ChatMessage> {
+    const started = Date.now();
     const effort = request.effort ?? options.effort;
-    const force = request.forceTool && !unforced.has(request.model) ? request.forceTool : null;
-    // A forced tool choice can't be combined with thinking, so a forced call doesn't think.
-    const thinking = Boolean(effort) && !force;
+    // The API allows thinking or a forced tool choice, not both. Thinking wins, since a call
+    // that stopped thinking partway through a tool loop would have to leave out the thinking
+    // blocks the loop's earlier turns carry.
+    const thinking = Boolean(effort);
+    const force = request.forceTool && !thinking && !refused && !unforced.has(request.model) ? request.forceTool : null;
     const body: Record<string, unknown> = {
       model: request.model,
       max_tokens: MAX_OUTPUT_TOKENS,
@@ -190,9 +197,9 @@ export function createChat(options: ClientOptions): Chat {
     try {
       payload = await post(`${options.baseUrl}/v1/messages`, { "x-api-key": options.apiKey, "anthropic-version": ANTHROPIC_VERSION }, body, timeoutMs);
     } catch (error) {
-      if (!force || !(error instanceof ModelError) || error.status !== 400 || !error.message.includes("tool_choice")) throw error;
+      if (!force || !(error instanceof ModelError) || error.status !== 400 || !/tool_choice.*not supported/s.test(error.message)) throw error;
       unforced.add(request.model);
-      return messages(request, timeoutMs);
+      return messages(request, Math.max(1_000, timeoutMs - (Date.now() - started)), true);
     }
     if (!Array.isArray(payload?.content)) throw new ModelError(502, "model API returned no content");
 

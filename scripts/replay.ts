@@ -18,7 +18,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { dedupe, normalizeCandidates, parseDiff, rank, toOutput, type Candidate } from "../src/findings.ts";
-import { loadEndpoint, parseEnvFile } from "../src/config.ts";
+import { readEndpoint } from "../src/config.ts";
 import { createChat, emptyUsage, type ChatMessage, type Usage } from "../src/llm.ts";
 import type { ToolDefinition } from "../src/tools.ts";
 import { readTools } from "../src/tools.ts";
@@ -48,8 +48,8 @@ const modelOverride = option("--model", "");
 const variant = await import(pathToFileURL(promptsPath).href) as { reviewerSystem: (focus: string | null) => string; submitReview: ToolDefinition };
 const system = variant.reviewerSystem(null);
 
-// The model endpoint's settings, from the shell or else .env, as for scripts/local-run.sh (docs/SETTINGS.md).
-const endpoint = loadEndpoint({ ...parseEnvFile(await readFile(join(here, ".env"), "utf8").catch(() => "")), ...process.env });
+// The model endpoint (docs/SETTINGS.md): each setting from the shell when it is set, or else from .env.
+const endpoint = readEndpoint(here);
 const usage = emptyUsage();
 const byCaller = new Map<string, Usage>();
 const chat = createChat({ ...endpoint, effort: null, usage, usageByCaller: byCaller });

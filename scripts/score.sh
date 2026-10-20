@@ -36,15 +36,16 @@ out="$run/${SCORING_NAME:-scoring}"
 mkdir -p "$out"
 
 # The judging CLI only accepts models in its bundled registry, which lags behind
-# OpenRouter. Register a missing model in a registry kept under runs/, leaving
-# any registry in the user's home directory alone.
-export PI_CODING_AGENT_DIR="$here/runs/.cache/judge-registry"
+# OpenRouter. Register a missing model in a registry kept with this scoring's
+# results, so scorings running at once each have their own, leaving any registry
+# in the user's home directory alone.
+export PI_CODING_AGENT_DIR="$out/judge-registry"
 mkdir -p "$PI_CODING_AGENT_DIR"
 rm -f "$PI_CODING_AGENT_DIR/models.json"
 [ -d "$bench/node_modules" ] || (cd "$bench" && npm ci --no-audit --no-fund >/dev/null)
-if [ "${RB_MODEL_API:-chat}" = anthropic ]; then
+if [ "${RB_MODEL_API:-chat}" = anthropic ] && [ "$provider" != openrouter ]; then
   # The endpoint may answer each request only whole, so the judge reaches it
-  # through the stream shim, which runs for this run alone.
+  # through the stream shim, which runs for this scoring alone.
   rm -f "$out/stream-shim.url"
   node "$here/scripts/stream-shim.ts" "$out/stream-shim.url" & shim=$!
   trap 'kill "$shim" 2>/dev/null || true' EXIT

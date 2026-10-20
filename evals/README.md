@@ -118,4 +118,4 @@ The report also lists reported findings that match no label. The ones that recur
 
 You need Docker, Node 24, `git`, the `gh` command for `eval:add`, and `OPENROUTER_API_KEY` in the environment or in `.env`.
 
-To use another model endpoint, set `RB_MODEL_BASE_URL`, `RB_MODEL_API`, `RB_MODEL_API_KEY` and `RB_MODEL_HEADERS` as [Settings](../docs/SETTINGS.md) describes, in the environment or in `.env`. The reviews and the matching both use it, so name models it serves with `--model` and `--judge`. A review whose endpoint is on this machine (`localhost`, `127.0.0.1` or `[::1]`) runs its container on the host's network to reach it.
+To use another model endpoint, set `RB_MODEL_BASE_URL`, `RB_MODEL_API`, `RB_MODEL_API_KEY` and `RB_MODEL_HEADERS` as [Settings](../docs/SETTINGS.md) describes, in the environment or in `.env`, where the environment's value wins. The reviews and the matching both use it, so name models it serves with `--model` and `--judge`. A review whose endpoint is on this machine (`localhost`, `127.0.0.1` or `[::1]`) runs its container on the host's network to reach it.
