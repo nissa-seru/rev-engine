@@ -1,5 +1,13 @@
-# Reviews a pull request in this repository with RevEngine itself.
-# A person with write access comments /review on a pull request, or runs this workflow with a pull request number.
+# Reviews a pull request in this repository with RevEngine itself, through a model endpoint
+# on a private tailnet. A person with write access comments /review on a pull request, or
+# runs this workflow with a pull request number.
+#
+# The runner joins the tailnet for the length of the job, as an ephemeral device tagged
+# tag:ci, through Tailscale's workload identity federation, so no Tailscale secret is stored
+# here. The tailnet's policy lets that tag reach the endpoint's port and nothing else on its
+# host. Repository variables TS_CLIENT_ID and TS_AUDIENCE name the federated identity,
+# MODEL_HOST is the endpoint's tailnet address, which the join waits to reach, and
+# MODEL_BASE_URL is the endpoint's URL. Secret MODEL_API_KEY is the endpoint's key.
 name: Review
 on:
   issue_comment:
@@ -12,13 +20,43 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  id-token: write
 jobs:
   review:
-    if: github.event_name == 'workflow_dispatch' || (github.event.issue.pull_request && (startsWith(github.event.comment.body, '/review ') || github.event.comment.body == '/review'))
+    # Only the repository's owner, members and collaborators get as far as joining the
+    # tailnet. The action then checks that the commenter can push.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+       (startsWith(github.event.comment.body, '/review ') || github.event.comment.body == '/review'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: laude-institute/rev-engine-prime@main
+      - name: Join the tailnet
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:
-          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:ci
+          ping: ${{ vars.MODEL_HOST }}
+
+      - name: Review
+        uses: nissa-seru/rev-engine@main
+        with:
+          model-base-url: ${{ vars.MODEL_BASE_URL }}
+          model-api: anthropic
+          model-api-key: ${{ secrets.MODEL_API_KEY }}
+          model: claude-opus-5-5
           pr-number: ${{ inputs.pr-number }}
+
+      # A review that can't run otherwise shows only in the Actions tab.
+      - name: Say why there is no review
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ inputs.pr-number || github.event.issue.number }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh pr comment "$NUMBER" --repo "$REPO" --body "The review couldn't run, so there is no review for this request. The run's log says why: $RUN"

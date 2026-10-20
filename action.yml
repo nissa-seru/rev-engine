@@ -3,8 +3,17 @@ description: Reviews a pull request with a model when a maintainer asks, and pos
 
 inputs:
   openrouter-api-key:
-    description: OpenRouter API key. Pass it from a repository secret.
-    required: true
+    description: OpenRouter API key. Pass it from a repository secret. Needed unless model-api-key is set.
+    default: ""
+  model-base-url:
+    description: Where model requests go, when not OpenRouter, as RB_MODEL_BASE_URL in docs/SETTINGS.md. The review container then shares the runner's network, so it reaches the endpoint the way the runner does.
+    default: ""
+  model-api:
+    description: The API the endpoint at model-base-url speaks, chat or anthropic, as RB_MODEL_API in docs/SETTINGS.md.
+    default: ""
+  model-api-key:
+    description: The key for the endpoint at model-base-url. Pass it from a repository secret.
+    default: ""
   github-token:
     description: Token used to read the pull request and post the review.
     default: ${{ github.token }}
@@ -15,7 +24,7 @@ inputs:
     description: A comment starts a review only when it is this text, or this text followed by a space.
     default: /review
   model:
-    description: OpenRouter model that reviews and verifies.
+    description: Model that reviews and verifies, as OpenRouter names it, or as the endpoint at model-base-url does.
     default: anthropic/claude-opus-5.5
   min-severity:
     description: The least severe findings that get a comment. One of high, medium or low. Less severe findings are listed in a collapsed section of the summary.
@@ -136,6 +145,9 @@ runs:
       shell: bash
       env:
         OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+        RB_MODEL_BASE_URL: ${{ inputs.model-base-url }}
+        RB_MODEL_API: ${{ inputs.model-api }}
+        RB_MODEL_API_KEY: ${{ inputs.model-api-key }}
         RB_NWO: ${{ github.repository }}
         RB_PR_NUMBER: ${{ steps.ask.outputs.number }}
         RB_BASE: ${{ steps.ask.outputs.base }}
@@ -145,11 +157,14 @@ runs:
         RB_CONFIG_FIT: ${{ inputs.fit == 'on' && inputs.model || '' }}
       run: |
         set -euo pipefail
-        docker run --rm \
+        # An endpoint of your own is reached the way the runner reaches it, such as over a VPN the job joined.
+        network=()
+        if [ -n "$RB_MODEL_BASE_URL" ]; then network=(--network host); fi
+        docker run --rm "${network[@]}" \
           -v "$GITHUB_WORKSPACE/rev-engine-prime-checkout:/work/repo:ro" \
           -v "$RUNNER_TEMP/rev-engine-prime/pr:/work/pr:ro" \
           -v "$RUNNER_TEMP/rev-engine-prime/out:/work/out" \
-          -e OPENROUTER_API_KEY -e RB_NWO -e RB_PR_NUMBER -e RB_BASE -e RB_HEAD \
+          -e OPENROUTER_API_KEY -e RB_MODEL_BASE_URL -e RB_MODEL_API -e RB_MODEL_API_KEY -e RB_NWO -e RB_PR_NUMBER -e RB_BASE -e RB_HEAD \
           -e RB_CONFIG_MODEL -e RB_CONFIG_TIME_BUDGET -e RB_CONFIG_FIT -e RB_DETAILS_OUT=/work/out/details.json \
           -e RB_REPO=/work/repo -e RB_DIFF=/work/pr/diff.patch -e RB_PR_JSON=/work/pr/pr.json -e RB_PRIOR_JSON=/work/pr/prior.json \
           -e RB_OUT=/work/out/findings.json -e RB_ATTEMPT=1 \
