@@ -2,12 +2,14 @@
 # on a private tailnet. A person with write access comments /review on a pull request, or
 # runs this workflow with a pull request number.
 #
-# The runner joins the tailnet for the length of the job, as an ephemeral device tagged
-# tag:ci, through Tailscale's workload identity federation, so no Tailscale secret is stored
-# here. The tailnet's policy lets that tag reach the endpoint's port and nothing else on its
-# host. Repository variables TS_CLIENT_ID and TS_AUDIENCE name the federated identity,
-# MODEL_HOST is the endpoint's tailnet address, which the join waits to reach, and
-# MODEL_BASE_URL is the endpoint's URL. Secret MODEL_API_KEY is the endpoint's key.
+# Once that person's write access is checked, the runner joins the tailnet for the length of
+# the job, as an ephemeral device tagged tag:ci, through Tailscale's workload identity
+# federation, so no Tailscale secret is stored here. The tailnet's policy is meant to let that
+# tag reach only the endpoint's port on its host; this file can't check that it does.
+# Repository variables TS_CLIENT_ID and TS_AUDIENCE name the federated identity, MODEL_HOST is
+# the endpoint's tailnet address, which the join waits to reach, and MODEL_BASE_URL is the
+# endpoint's base URL for Anthropic Messages, to which the client adds /v1/messages. Secret
+# MODEL_API_KEY is the endpoint's key.
 name: Review
 on:
   issue_comment:
@@ -23,17 +25,29 @@ permissions:
   id-token: write
 jobs:
   review:
-    # Only the repository's owner, members and collaborators get as far as joining the
-    # tailnet. The action then checks that the commenter can push.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.issue.pull_request &&
-       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
        (startsWith(github.event.comment.body, '/review ') || github.event.comment.body == '/review'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # The action checks this too, but only after the join, so it is checked here first.
+      - name: Check who asked
+        id: who
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          permission=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2>/dev/null || echo none)
+          case "$permission" in
+            admin|write) echo "allowed=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::notice::No review: $ACTOR does not have write access to $REPO" ;;
+          esac
+
       - name: Join the tailnet
+        if: steps.who.outputs.allowed == 'true'
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:
           oauth-client-id: ${{ vars.TS_CLIENT_ID }}
@@ -42,6 +56,7 @@ jobs:
           ping: ${{ vars.MODEL_HOST }}
 
       - name: Review
+        if: steps.who.outputs.allowed == 'true'
         uses: nissa-seru/rev-engine@main
         with:
           model-base-url: ${{ vars.MODEL_BASE_URL }}
@@ -50,13 +65,13 @@ jobs:
           model: claude-opus-5-5
           pr-number: ${{ inputs.pr-number }}
 
-      # A review that can't run otherwise shows only in the Actions tab.
-      - name: Say why there is no review
-        if: failure()
+      # A review that stops partway otherwise shows only in the Actions tab.
+      - name: Say that the review stopped
+        if: (failure() || cancelled()) && steps.who.outputs.allowed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           NUMBER: ${{ inputs.pr-number || github.event.issue.number }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh pr comment "$NUMBER" --repo "$REPO" --body "The review couldn't run, so there is no review for this request. The run's log says why: $RUN"
+          gh pr comment "$NUMBER" --repo "$REPO" --body "The review run stopped before it finished, so its review may be missing or incomplete. The run's log says why: $RUN"

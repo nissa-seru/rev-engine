@@ -50,9 +50,10 @@ const keys = option("--keys")?.split(",") ?? null;
 const levels = (option("--levels") ?? "opened,diff,file,none").split(",");
 const runDir = join(here, "runs", name);
 
-// The model endpoint (docs/SETTINGS.md): each setting from the shell when it is set, or else from .env.
+// The model endpoint (docs/SETTINGS.md): each setting from the shell when it is set and not empty, or else from .env.
 const endpoint = readEndpoint(here);
-// The judge, as for scripts/score.sh: Gemini 3.5 Flash on OpenRouter, Claude Sonnet 5 on an Anthropic endpoint.
+// The judge's default model: Gemini 3.5 Flash on OpenRouter, Claude Sonnet 5 on an Anthropic endpoint.
+// Unlike scripts/score.sh, this judge always uses the endpoint, and JUDGE_PROVIDER doesn't apply.
 const JUDGE_MODEL = process.env.JUDGE_MODEL ?? (endpoint.api === "anthropic" ? "claude-sonnet-5" : "google/gemini-3.5-flash");
 const usage = emptyUsage();
 const byCaller = new Map<string, Usage>();
@@ -175,7 +176,12 @@ async function probe(miss: Miss, messages: ChatMessage[], model: string, head: s
       ],
     });
     const verdictCall = verdict.tool_calls?.find((item) => item.function.name === submitMatch.function.name);
-    const verdictValue: unknown = verdictCall ? JSON.parse(verdictCall.function.arguments).same_problem : null;
+    let verdictValue: unknown = null;
+    try {
+      verdictValue = verdictCall ? JSON.parse(verdictCall.function.arguments)?.same_problem : null;
+    } catch {
+      // Arguments that aren't JSON give no yes or no.
+    }
     same = typeof verdictValue === "boolean" ? verdictValue : null;
   }
   const outcome = !answer ? "no answer" : !answer.problem_found ? "not found" : same === null ? "no verdict" : same ? "found" : "other";

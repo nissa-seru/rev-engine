@@ -103,7 +103,7 @@ export function loadEndpoint(env: Env): Endpoint {
   const apiKey = env.RB_MODEL_API_KEY?.trim() || env.OPENROUTER_API_KEY?.trim();
   if (!apiKey) throw new Error("missing OPENROUTER_API_KEY, or RB_MODEL_API_KEY");
   const baseUrl = env.RB_MODEL_BASE_URL?.trim();
-  // OpenRouter's URL is the default only for its own API, so an endpoint's key never goes there by default.
+  // OpenRouter's URL is the default only for chat, so a Messages endpoint's key isn't sent there unasked.
   if (!baseUrl && api !== "chat") throw new Error(`RB_MODEL_API=${api} needs RB_MODEL_BASE_URL`);
   return {
     apiKey,

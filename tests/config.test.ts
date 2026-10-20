@@ -105,7 +105,7 @@ test("reads the model API and a key that is not OpenRouter's", () => {
   assert.equal(loadConfig({ ...BASE, RB_MODEL_API_KEY: "other-key" }).apiKey, "other-key");
   assert.throws(() => loadConfig({ ...BASE, RB_MODEL_API: "responses" }), /RB_MODEL_API must be chat or anthropic/);
   assert.throws(() => loadConfig(withoutOpenRouter), /missing OPENROUTER_API_KEY, or RB_MODEL_API_KEY/);
-  // OpenRouter's URL isn't a default for another API, so an endpoint's key never goes there unasked.
+  // OpenRouter's URL isn't a default for another API, so a Messages endpoint's key isn't sent there unasked.
   assert.throws(() => loadConfig({ ...BASE, RB_MODEL_API: "anthropic" }), /RB_MODEL_API=anthropic needs RB_MODEL_BASE_URL/);
 });
 

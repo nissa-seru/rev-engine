@@ -12,7 +12,7 @@ inputs:
     description: The API the endpoint at model-base-url speaks, chat or anthropic, as RB_MODEL_API in docs/SETTINGS.md.
     default: ""
   model-api-key:
-    description: The key for the endpoint at model-base-url. Pass it from a repository secret.
+    description: The key for the endpoint at model-base-url, which gets no other key. Pass it from a repository secret.
     default: ""
   github-token:
     description: Token used to read the pull request and post the review.
@@ -144,7 +144,8 @@ runs:
       if: steps.ask.outputs.run == 'true'
       shell: bash
       env:
-        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+        # An endpoint of your own gets model-api-key alone, never the OpenRouter key.
+        OPENROUTER_API_KEY: ${{ inputs.model-base-url == '' && inputs.openrouter-api-key || '' }}
         RB_MODEL_BASE_URL: ${{ inputs.model-base-url }}
         RB_MODEL_API: ${{ inputs.model-api }}
         RB_MODEL_API_KEY: ${{ inputs.model-api-key }}

@@ -179,8 +179,8 @@ export function createChat(options: ClientOptions): Chat {
   async function messages(request: ChatRequest, timeoutMs: number, refused = false): Promise<ChatMessage> {
     const started = Date.now();
     const effort = request.effort ?? options.effort;
-    // The API allows thinking or a forced tool choice, not both. Thinking wins, since the API
-    // also doesn't let thinking be switched off partway through a tool loop.
+    // The API allows thinking or a forced tool choice, not both. Thinking wins, so a call with an
+    // effort keeps reasoning, and the prompt asks for the tool in words.
     const thinking = Boolean(effort);
     const force = request.forceTool && !thinking && !refused && !unforced.has(request.model) ? request.forceTool : null;
     const body: Record<string, unknown> = {

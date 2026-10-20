@@ -212,7 +212,7 @@ async function pool(jobs: Array<() => Promise<void>>, width: number): Promise<vo
 const options = parseArguments(process.argv.slice(2));
 const cases = await loadCases(options.cases, options.split);
 if (!cases.length) throw new Error("no eval cases found in evals/cases or evals/private");
-// The model endpoint the reviews and the matching use (docs/SETTINGS.md): each setting from the shell when it is set, or else from .env.
+// The model endpoint the reviews and the matching use (docs/SETTINGS.md): each setting from the shell when it is set and not empty, or else from .env.
 const endpoint = readEndpoint(root);
 const runRoot = join(root, "runs/evals", options.name);
 const say = (message: string): void => console.error(`eval: ${message}`);

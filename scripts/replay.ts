@@ -48,7 +48,7 @@ const modelOverride = option("--model", "");
 const variant = await import(pathToFileURL(promptsPath).href) as { reviewerSystem: (focus: string | null) => string; submitReview: ToolDefinition };
 const system = variant.reviewerSystem(null);
 
-// The model endpoint (docs/SETTINGS.md): each setting from the shell when it is set, or else from .env.
+// The model endpoint (docs/SETTINGS.md): each setting from the shell when it is set and not empty, or else from .env.
 const endpoint = readEndpoint(here);
 const usage = emptyUsage();
 const byCaller = new Map<string, Usage>();

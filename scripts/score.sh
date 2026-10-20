@@ -7,8 +7,9 @@
 #
 # JUDGE_PROVIDER and JUDGE_MODEL choose the judge (default: openrouter,
 # google/gemini-3.5-flash). With RB_MODEL_API=anthropic (docs/SETTINGS.md), the
-# judge is that endpoint's instead (default: Claude Sonnet 5, the leaderboard's
-# judge), reached through scripts/stream-shim.ts, since the judging CLI streams.
+# judge is that endpoint's instead, unless JUDGE_PROVIDER=openrouter (default:
+# Claude Sonnet 5, the leaderboard's judge), reached through scripts/stream-shim.ts,
+# since the judging CLI streams.
 # Scores from different judges are not comparable.
 # JUDGE_ARGS passes extra options to the judging CLI, such as --no-strict to
 # accept a score when the judge itself fails on a pull request.

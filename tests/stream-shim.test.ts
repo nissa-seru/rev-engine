@@ -95,7 +95,7 @@ function reassemble(text: string): Record<string, any> {
     } else if (event === "message_delta") Object.assign(message, data.delta, { usage: data.usage });
   }
   assert.equal(names.at(-1), "message_stop");
-  assert.equal(stopped.size, message.content.length);
+  assert.deepEqual([...stopped].sort((a, b) => a - b), message.content.map((_: unknown, index: number) => index));
   return message;
 }
 
