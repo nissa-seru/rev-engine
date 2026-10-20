@@ -6,7 +6,10 @@
 #   scripts/score.sh <run-name>
 #
 # JUDGE_PROVIDER and JUDGE_MODEL choose the judge (default: openrouter,
-# google/gemini-3.5-flash). Scores from different judges are not comparable.
+# google/gemini-3.5-flash). With RB_MODEL_API=anthropic (docs/SETTINGS.md), the
+# judge is that endpoint's instead (default: Claude Sonnet 5, the leaderboard's
+# judge), reached through scripts/stream-shim.ts, since the judging CLI streams.
+# Scores from different judges are not comparable.
 # JUDGE_ARGS passes extra options to the judging CLI, such as --no-strict to
 # accept a score when the judge itself fails on a pull request.
 # SCORING_NAME names the output directory (default: scoring), so one run can
@@ -22,8 +25,13 @@ run="$here/runs/$1"
 [ -d "$run/findings" ] || { echo "no findings in $run" >&2; exit 2; }
 
 if [ -f "$here/.env" ]; then set -a; . "$here/.env"; set +a; fi
-provider="${JUDGE_PROVIDER:-openrouter}"
-model="${JUDGE_MODEL:-google/gemini-3.5-flash}"
+if [ "${RB_MODEL_API:-chat}" = anthropic ]; then
+  provider="${JUDGE_PROVIDER:-model-endpoint}"
+  model="${JUDGE_MODEL:-claude-sonnet-5}"
+else
+  provider="${JUDGE_PROVIDER:-openrouter}"
+  model="${JUDGE_MODEL:-google/gemini-3.5-flash}"
+fi
 out="$run/${SCORING_NAME:-scoring}"
 mkdir -p "$out"
 
@@ -34,7 +42,20 @@ export PI_CODING_AGENT_DIR="$here/runs/.cache/judge-registry"
 mkdir -p "$PI_CODING_AGENT_DIR"
 rm -f "$PI_CODING_AGENT_DIR/models.json"
 [ -d "$bench/node_modules" ] || (cd "$bench" && npm ci --no-audit --no-fund >/dev/null)
-if [ "$provider" = openrouter ] && ! (cd "$bench" && npx pi --list-models 2>/dev/null | awk '$1 == "openrouter" {print $2}' | grep -qxF "$model"); then
+if [ "${RB_MODEL_API:-chat}" = anthropic ]; then
+  # The endpoint may answer each request only whole, so the judge reaches it
+  # through the stream shim, which runs for this run alone.
+  rm -f "$out/stream-shim.url"
+  node "$here/scripts/stream-shim.ts" "$out/stream-shim.url" & shim=$!
+  trap 'kill "$shim" 2>/dev/null || true' EXIT
+  for _ in $(seq 50); do [ -s "$out/stream-shim.url" ] && break; sleep 0.2; done
+  [ -s "$out/stream-shim.url" ] || { echo "the stream shim did not start" >&2; exit 2; }
+  key=RB_MODEL_API_KEY; [ -n "${RB_MODEL_API_KEY:-}" ] || key=OPENROUTER_API_KEY
+  jq -n --arg provider "$provider" --arg url "$(cat "$out/stream-shim.url")" --arg key "$key" --arg id "$model" '{providers: {($provider): {
+    baseUrl: $url, apiKey: $key, api: "anthropic-messages",
+    models: [{id: $id, reasoning: true, input: ["text"], contextWindow: 200000, maxTokens: 32000, compat: {forceAdaptiveThinking: true}}]}}}' \
+    > "$PI_CODING_AGENT_DIR/models.json"
+elif [ "$provider" = openrouter ] && ! (cd "$bench" && npx pi --list-models 2>/dev/null | awk '$1 == "openrouter" {print $2}' | grep -qxF "$model"); then
   jq -n --arg id "$model" '{providers: {openrouter: {
     baseUrl: "https://openrouter.ai/api/v1", apiKey: "OPENROUTER_API_KEY", api: "openai-completions",
     models: [{id: $id, reasoning: true, input: ["text"], contextWindow: 1000000, maxTokens: 32000}]}}}' \

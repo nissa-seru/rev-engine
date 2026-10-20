@@ -52,6 +52,7 @@ The benchmark publishes all 219 pull requests and their expected findings. That 
 | `action/` | Turns the findings file into one GitHub review and posts it, and collects the maintainer's decisions on earlier reviews (`collect.ts`, `decisions.ts`). |
 | `scripts/local-run.sh` | Builds the image and runs benchmark pull requests locally. |
 | `scripts/score.sh` | Scores a run with the benchmark's judging CLI. |
+| `scripts/stream-shim.ts` | Streams Anthropic Messages answers to the judging CLI from an endpoint that answers whole. |
 | `scripts/coverage.ts` | Shows whether a run's reviewers read the code behind each expected finding. |
 | `scripts/replay.ts` | Replays the reporting step of a recorded run with another prompt. |
 | `scripts/box.sh` | Creates an EC2 box and runs a queue of experiments on it. |
