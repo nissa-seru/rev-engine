@@ -20,7 +20,7 @@ jobs:
     uses: nissa-seru/rev-engine/.github/workflows/org-review.yml@main
     with:
       # This repository's own pull requests are the house's, reviewed on request.
-      at-open: "[]"
+      at-open: false
       pr-number: ${{ inputs.pr-number }}
     secrets:
       MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
