@@ -263,7 +263,10 @@ export function toAnthropic(messages: ChatMessage[], thinking: boolean): { syste
     if (message.role === "user") add("user", message.content ? [{ type: "text", text: message.content }] : []);
     else if (message.role === "tool") add("user", [{ type: "tool_result", tool_use_id: message.tool_call_id ?? "", content: message.content ?? "" }]);
     else if (message.role === "assistant") {
-      const reasoning = thinking && Array.isArray(message.reasoning_details) ? (message.reasoning_details as AnthropicBlock[]) : [];
+      // Only Anthropic's own thinking blocks go back: a recorded conversation may carry another provider's reasoning.
+      const reasoning = thinking && Array.isArray(message.reasoning_details)
+        ? (message.reasoning_details as AnthropicBlock[]).filter((block) => block?.type === "thinking" || block?.type === "redacted_thinking")
+        : [];
       add("assistant", [
         ...reasoning,
         ...(message.content ? [{ type: "text", text: message.content }] : []),

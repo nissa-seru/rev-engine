@@ -26,6 +26,7 @@ import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
+import { loadEndpoint, parseEnvFile } from "../src/config.ts";
 import { createChat, emptyUsage, type ChatMessage, type Usage } from "../src/llm.ts";
 import { readTools, type ToolDefinition } from "../src/tools.ts";
 
@@ -49,12 +50,11 @@ const keys = option("--keys")?.split(",") ?? null;
 const levels = (option("--levels") ?? "opened,diff,file,none").split(",");
 const runDir = join(here, "runs", name);
 
-const env = await readFile(join(here, ".env"), "utf8").catch(() => "");
-const apiKey = process.env.OPENROUTER_API_KEY || /^OPENROUTER_API_KEY=(.*)$/m.exec(env)?.[1]?.trim().replace(/^["']|["']$/g, "");
-if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
+// The model endpoint's settings, from the shell or else .env, as for scripts/local-run.sh (docs/SETTINGS.md).
+const endpoint = loadEndpoint({ ...parseEnvFile(await readFile(join(here, ".env"), "utf8").catch(() => "")), ...process.env });
 const usage = emptyUsage();
 const byCaller = new Map<string, Usage>();
-const chat = createChat({ apiKey, baseUrl: "https://openrouter.ai/api/v1", effort: null, usage, usageByCaller: byCaller });
+const chat = createChat({ ...endpoint, effort: null, usage, usageByCaller: byCaller });
 
 const answerProbe: ToolDefinition = {
   type: "function",

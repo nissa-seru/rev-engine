@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createChat, emptyUsage, type Usage } from "../src/llm.ts";
+import { createChat, emptyUsage, toAnthropic, type Usage } from "../src/llm.ts";
 
 function replying(usage: Record<string, unknown>): typeof fetch {
   return (async () => new Response(JSON.stringify({
@@ -131,4 +131,13 @@ test("a model that refuses a forced tool choice is asked again, and from then on
   await chat(request);
   assert.equal(reply.tool_calls?.[0]?.function.name, "submit");
   assert.deepEqual(choices, [{ type: "tool", name: "submit" }, { type: "auto" }, { type: "auto" }]);
+});
+
+test("only Anthropic's own thinking blocks go back to Anthropic Messages", () => {
+  const { messages } = toAnthropic([
+    { role: "user", content: "Review." },
+    { role: "assistant", content: "Done.", reasoning_details: [{ type: "reasoning.text", text: "another provider's" }, { type: "thinking", thinking: "", signature: "s1" }] },
+    { role: "user", content: "Again." },
+  ], true);
+  assert.deepEqual(messages[1], { role: "assistant", content: [{ type: "thinking", thinking: "", signature: "s1" }, { type: "text", text: "Done." }] });
 });

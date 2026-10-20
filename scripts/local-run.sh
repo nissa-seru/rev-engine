@@ -9,7 +9,8 @@
 #   JOBS=5 scripts/local-run.sh cheap -e RB_CONFIG_MODEL=vendor/model
 #
 # Needs a clone of https://github.com/review-bench/ReviewBench beside this
-# repository, or at $REVIEWBENCH_DIR, and OPENROUTER_API_KEY in .env or the shell.
+# repository, or at $REVIEWBENCH_DIR, and OPENROUTER_API_KEY in .env or the shell,
+# or another model endpoint's RB_MODEL_* settings there (docs/SETTINGS.md).
 # Results land in runs/<run-name>/, which git ignores.
 #
 # JOBS=<n> runs n pull requests of the test set at a time. The full set shares
@@ -25,7 +26,9 @@ bench="${REVIEWBENCH_DIR:-$here/../ReviewBench}"
 [ -x "$bench/scripts/try-agent.sh" ] || { echo "no ReviewBench clone at $bench; set REVIEWBENCH_DIR" >&2; exit 2; }
 
 if [ -f "$here/.env" ]; then set -a; . "$here/.env"; set +a; fi
-[ -n "${OPENROUTER_API_KEY:-}" ] || { echo "OPENROUTER_API_KEY is not set" >&2; exit 2; }
+[ -n "${RB_MODEL_API_KEY:-${OPENROUTER_API_KEY:-}}" ] || { echo "OPENROUTER_API_KEY is not set, nor RB_MODEL_API_KEY" >&2; exit 2; }
+# The endpoint's settings, each passed to the container only when it is set.
+model_env=(-e OPENROUTER_API_KEY -e RB_MODEL_API_KEY -e RB_MODEL_BASE_URL -e RB_MODEL_API -e RB_MODEL_HEADERS)
 
 image="${IMAGE:-rev-engine-prime:dev}"
 docker build --quiet --platform linux/amd64 -t "$image" "$here" >/dev/null
@@ -34,6 +37,20 @@ run="$here/runs/$name"
 mkdir -p "$run/logs" "$here/runs/.cache/repos" "$run/.try-agent"
 # Share fetched repositories between runs; everything else stays per run.
 [ -e "$run/.try-agent/repos" ] || ln -s "$here/runs/.cache/repos" "$run/.try-agent/repos"
+
+# try-agent.sh runs each container on Docker's default network, which can't reach an
+# endpoint on this machine's loopback, and it has no option for another network. For
+# such an endpoint, the docker it calls runs its containers on the host's network.
+host=$(sed -E 's#^[a-z]+://(\[[^]]*\]|[^/:]+).*#\1#' <<<"${RB_MODEL_BASE_URL:-}")
+case "$host" in
+  localhost|127.0.0.1|'[::1]')
+    docker="$(command -v docker)"
+    mkdir -p "$run/.bin"
+    printf '#!/bin/sh\nif [ "$1" = run ]; then shift; exec "%s" run --network host "$@"; fi\nexec "%s" "$@"\n' "$docker" "$docker" > "$run/.bin/docker"
+    chmod +x "$run/.bin/docker"
+    export PATH="$run/.bin:$PATH"
+    ;;
+esac
 cd "$run"
 
 jobs="${JOBS:-1}"
@@ -42,7 +59,7 @@ single=0
 case " $* " in *" --pr "*|*" --set full "*) single=1 ;; esac
 
 if [ "$single" -eq 1 ] || { [ "$jobs" -le 1 ] && [ "$prs" = all ]; }; then
-  "$bench/scripts/try-agent.sh" "$image" -e OPENROUTER_API_KEY -e RB_CONTEXT_OUT=/work/out/context.json "$@" 2>&1 | tee "logs/run.log"
+  "$bench/scripts/try-agent.sh" "$image" "${model_env[@]}" -e RB_CONTEXT_OUT=/work/out/context.json "$@" 2>&1 | tee "logs/run.log"
   exit "${PIPESTATUS[0]}"
 fi
 
@@ -55,7 +72,7 @@ count=$(wc -l <<<"$indexes" | tr -d ' ')
 export bench image
 rm -rf findings logs/pr-*.log
 xargs -P "$jobs" -I{} sh -c \
-  '"$bench/scripts/try-agent.sh" "$image" -e OPENROUTER_API_KEY -e RB_CONTEXT_OUT=/work/out/context.json --pr {} "$@" > "logs/pr-{}.log" 2>&1 || true' sh "$@" <<<"$indexes"
+  '"$bench/scripts/try-agent.sh" "$image" -e OPENROUTER_API_KEY -e RB_MODEL_API_KEY -e RB_MODEL_BASE_URL -e RB_MODEL_API -e RB_MODEL_HEADERS -e RB_CONTEXT_OUT=/work/out/context.json --pr {} "$@" > "logs/pr-{}.log" 2>&1 || true' sh "$@" <<<"$indexes"
 done_count=$(find findings -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
 grep -h -E '^(==|   (ok|FAIL))' logs/pr-*.log || true
 echo "$done_count of $count pull requests produced a valid findings file; logs in $run/logs" >&2

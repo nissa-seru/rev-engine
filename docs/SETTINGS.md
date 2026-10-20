@@ -9,7 +9,7 @@ The model endpoint can be another one, such as a gateway of your own:
 | `RB_MODEL_BASE_URL` | `https://openrouter.ai/api/v1` | Where model requests go. |
 | `RB_MODEL_API` | `chat` | The API the endpoint speaks. `chat` is OpenAI-compatible chat completions at `<base URL>/chat/completions`. `anthropic` is Anthropic Messages at `<base URL>/v1/messages`, the way Anthropic's SDKs join their base URL, so the base URL is `https://api.anthropic.com` for Anthropic itself. Model names are then the endpoint's own, such as `claude-opus-5-5`, not OpenRouter's. |
 | `RB_MODEL_API_KEY` | `OPENROUTER_API_KEY` | The endpoint's key, in place of `OPENROUTER_API_KEY`. It goes in `x-api-key` for `anthropic` and as a bearer token for `chat`. |
-| `RB_MODEL_HEADERS` | none | Extra headers for every model request, as a JSON object of names and string values, such as `{"x-priority":"low"}`. |
+| `RB_MODEL_HEADERS` | none | Extra headers for every model request, as a JSON object of names and string values, such as `{"x-priority":"low"}`. In a `.env` file, which `scripts/local-run.sh` reads with the shell, put it in single quotes. |
 
 With `anthropic`, the run reports tokens but no cost, since the Messages API returns none. `RB_CONFIG_EFFORT` turns on adaptive thinking at that effort. A call that forces a tool doesn't think, since the API allows only one of the two, and a model that refuses a forced tool choice is left to choose for the rest of the run.
 

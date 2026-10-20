@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEFAULT_BASE_URL, DEFAULT_MODEL, describeSettings, loadConfig } from "../src/config.ts";
+import { DEFAULT_BASE_URL, DEFAULT_MODEL, describeSettings, loadConfig, loadEndpoint, parseEnvFile } from "../src/config.ts";
 
 const BASE = {
   RB_NWO: "owner/repo",
@@ -110,4 +110,11 @@ test("reads extra model request headers as a JSON object", () => {
   for (const bad of ["x-class: batch", '["x"]', '{"x-count":1}']) {
     assert.throws(() => loadConfig({ ...BASE, RB_MODEL_HEADERS: bad }), /RB_MODEL_HEADERS must be a JSON object/, bad);
   }
+});
+
+test("reads a .env file's settings, taking one pair of quotes off a value", () => {
+  const text = "# a comment\nRB_MODEL_API=anthropic\nRB_MODEL_HEADERS='{\"x-class\":\"batch\"}'\nOPENROUTER_API_KEY=\"quoted\"\nnot a setting\n";
+  const settings = parseEnvFile(text);
+  assert.deepEqual(settings, { RB_MODEL_API: "anthropic", RB_MODEL_HEADERS: '{"x-class":"batch"}', OPENROUTER_API_KEY: "quoted" });
+  assert.deepEqual(loadEndpoint(settings), { apiKey: "quoted", baseUrl: DEFAULT_BASE_URL, api: "anthropic", headers: { "x-class": "batch" } });
 });

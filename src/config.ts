@@ -7,7 +7,7 @@ import { FOCUS_NAMES } from "./prompts.ts";
 export type VerifyMode = "off" | "lenient" | "strict";
 export type SecondLookMode = "on" | "off" | "sweep" | "sweep-low" | "small";
 
-export interface Config {
+export interface Config extends Endpoint {
   nwo: string;
   prNumber: number;
   base: string;
@@ -21,12 +21,6 @@ export interface Config {
   outPath: string;
   /** Which attempt at this pull request this is, starting at 1. */
   attempt: number;
-  apiKey: string;
-  baseUrl: string;
-  /** The API the endpoint at baseUrl speaks. */
-  api: ModelApi;
-  /** Extra headers for every model request. */
-  headers: Record<string, string>;
   /** One independent review seat per model. */
   models: string[];
   /** For each seat, the one focus it reviews for, or null for the full review. */
@@ -93,8 +87,39 @@ function integer(env: Env, name: string, fallback: number, min: number, max: num
   return value;
 }
 
+/** The model endpoint: where requests go, the API it speaks, its key and any extra headers. */
+export interface Endpoint {
+  apiKey: string;
+  baseUrl: string;
+  api: ModelApi;
+  headers: Record<string, string>;
+}
+
+/** Reads the endpoint settings (docs/SETTINGS.md). The scripts and evals that run on the host use it too. */
+export function loadEndpoint(env: Env): Endpoint {
+  const api = (env.RB_MODEL_API?.trim() || "chat") as ModelApi;
+  if (!["chat", "anthropic"].includes(api)) throw new Error("RB_MODEL_API must be chat or anthropic");
+  const apiKey = env.RB_MODEL_API_KEY?.trim() || env.OPENROUTER_API_KEY?.trim();
+  if (!apiKey) throw new Error("missing OPENROUTER_API_KEY, or RB_MODEL_API_KEY");
+  return {
+    apiKey,
+    baseUrl: (env.RB_MODEL_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, ""),
+    api,
+    headers: modelHeaders(env.RB_MODEL_HEADERS),
+  };
+}
+
+/** NAME=VALUE lines of a .env file, with one pair of surrounding quotes taken off each value. */
+export function parseEnvFile(text: string): Record<string, string> {
+  const settings: Record<string, string> = {};
+  for (const match of text.matchAll(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/gm)) {
+    settings[match[1]!] = match[2]!.trim().replace(/^(["'])(.*)\1$/, "$2");
+  }
+  return settings;
+}
+
 /** RB_MODEL_HEADERS: a JSON object of header names and string values. */
-export function modelHeaders(raw: string | undefined): Record<string, string> {
+function modelHeaders(raw: string | undefined): Record<string, string> {
   if (!raw?.trim()) return {};
   let value: unknown;
   try {
@@ -143,11 +168,7 @@ export function loadConfig(env: Env): Config {
 
   const outPath = required(env, "RB_OUT");
 
-  const api = (env.RB_MODEL_API?.trim() || "chat") as ModelApi;
-  if (!["chat", "anthropic"].includes(api)) throw new Error("RB_MODEL_API must be chat or anthropic");
-  const apiKey = env.RB_MODEL_API_KEY?.trim() || env.OPENROUTER_API_KEY?.trim();
-  if (!apiKey) throw new Error("missing OPENROUTER_API_KEY, or RB_MODEL_API_KEY");
-  const headers = modelHeaders(env.RB_MODEL_HEADERS);
+  const endpoint = loadEndpoint(env);
 
   return {
     nwo: required(env, "RB_NWO"),
@@ -161,10 +182,7 @@ export function loadConfig(env: Env): Config {
     priorJsonPath: env.RB_PRIOR_JSON?.trim() || "/work/pr/prior.json",
     outPath,
     attempt: integer(env, "RB_ATTEMPT", 1, 1, 1000),
-    apiKey,
-    baseUrl: (env.RB_MODEL_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, ""),
-    api,
-    headers,
+    ...endpoint,
     models,
     focuses,
     verifierModel: env.RB_CONFIG_VERIFIER?.trim() || models[0]!,

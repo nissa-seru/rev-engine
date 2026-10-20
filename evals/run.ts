@@ -13,8 +13,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Finding } from "../action/comments.ts";
-import { DEFAULT_BASE_URL, modelHeaders } from "../src/config.ts";
-import { createChat, emptyUsage, type ModelApi } from "../src/llm.ts";
+import { loadEndpoint, parseEnvFile, type Endpoint } from "../src/config.ts";
+import { createChat, emptyUsage } from "../src/llm.ts";
 import type { ToolDefinition } from "../src/tools.ts";
 import { parseCase, renderReport, scoreCase, withEarlierDecisions, type EvalCase, type RunResult } from "./lib.ts";
 
@@ -78,29 +78,6 @@ async function loadCases(only: string[], split?: "tune" | "check"): Promise<Eval
   return split ? named.filter((item) => (item.split ?? "tune") === split) : named;
 }
 
-/** The model endpoint the reviews and the matching use, as the reviewer reads it (docs/SETTINGS.md). */
-interface Endpoint {
-  key: string;
-  baseUrl: string;
-  api: ModelApi;
-  /** RB_MODEL_HEADERS as set, passed on to the reviewer unchanged. */
-  rawHeaders?: string;
-  headers: Record<string, string>;
-}
-
-/** Each setting comes from the environment, or else from .env. */
-async function endpoint(): Promise<Endpoint> {
-  const text = await readFile(join(root, ".env"), "utf8").catch(() => "");
-  const setting = (name: string): string | undefined =>
-    process.env[name]?.trim() || new RegExp(`^${name}=(.+)$`, "m").exec(text)?.[1]?.trim().replace(/^["']|["']$/g, "") || undefined;
-  const key = setting("RB_MODEL_API_KEY") ?? setting("OPENROUTER_API_KEY");
-  if (!key) throw new Error("set OPENROUTER_API_KEY or RB_MODEL_API_KEY, or put it in .env");
-  const api = setting("RB_MODEL_API") ?? "chat";
-  if (api !== "chat" && api !== "anthropic") throw new Error("RB_MODEL_API must be chat or anthropic");
-  const rawHeaders = setting("RB_MODEL_HEADERS");
-  return { key, baseUrl: (setting("RB_MODEL_BASE_URL") ?? DEFAULT_BASE_URL).replace(/\/+$/, ""), api, rawHeaders, headers: modelHeaders(rawHeaders) };
-}
-
 function onThisMachine(url: string): boolean {
   return ["localhost", "127.0.0.1", "[::1]"].includes(new URL(url).hostname);
 }
@@ -130,24 +107,24 @@ async function prepare(evalCase: EvalCase, directory: string, noPrior: boolean):
   else await rm(join(directory, "pr/prior.json"), { force: true });
 }
 
-async function review(evalCase: EvalCase, directory: string, out: string, options: Options, provider: Endpoint): Promise<void> {
+async function review(evalCase: EvalCase, directory: string, out: string, options: Options, endpoint: Endpoint): Promise<void> {
   await rm(out, { recursive: true, force: true });
   await mkdir(out, { recursive: true });
   const env = {
     RB_NWO: evalCase.repo, RB_PR_NUMBER: String(evalCase.pr), RB_BASE: evalCase.base, RB_HEAD: evalCase.head,
     RB_CONFIG_MODEL: options.model, RB_CONFIG_FIT: options.model, RB_DETAILS_OUT: "/work/out/details.json", RB_CONTEXT_OUT: "/work/out/context.json",
     RB_REPO: "/work/repo", RB_DIFF: "/work/pr/diff.patch", RB_PR_JSON: "/work/pr/pr.json", RB_PRIOR_JSON: "/work/pr/prior.json", RB_OUT: "/work/out/findings.json", RB_ATTEMPT: "1",
-    RB_MODEL_BASE_URL: provider.baseUrl, RB_MODEL_API: provider.api,
-    ...(provider.rawHeaders ? { RB_MODEL_HEADERS: provider.rawHeaders } : {}),
+    RB_MODEL_BASE_URL: endpoint.baseUrl, RB_MODEL_API: endpoint.api,
+    ...(Object.keys(endpoint.headers).length ? { RB_MODEL_HEADERS: JSON.stringify(endpoint.headers) } : {}),
   };
   const args = [
     "run", "--rm", "-v", `${join(directory, "repo")}:/work/repo:ro`, "-v", `${join(directory, "pr")}:/work/pr:ro`, "-v", `${out}:/work/out`,
     // A model endpoint on this machine is reached through the host's network.
-    ...(onThisMachine(provider.baseUrl) ? ["--network", "host"] : []),
+    ...(onThisMachine(endpoint.baseUrl) ? ["--network", "host"] : []),
     "-e", "RB_MODEL_API_KEY", ...Object.entries(env).flatMap(([name, value]) => ["-e", `${name}=${value}`]), IMAGE,
   ];
   // The key travels in the environment, not on the command line.
-  const result = await exec("docker", args, { env: { ...process.env, RB_MODEL_API_KEY: provider.key }, timeout: REVIEW_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 })
+  const result = await exec("docker", args, { env: { ...process.env, RB_MODEL_API_KEY: endpoint.apiKey }, timeout: REVIEW_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 })
     .catch((error: { stderr?: string; message: string }) => ({ stderr: `${error.stderr ?? ""}\n${error.message}` }));
   await writeFile(join(out, "log.txt"), result.stderr ?? "");
 }
@@ -235,7 +212,8 @@ async function pool(jobs: Array<() => Promise<void>>, width: number): Promise<vo
 const options = parseArguments(process.argv.slice(2));
 const cases = await loadCases(options.cases, options.split);
 if (!cases.length) throw new Error("no eval cases found in evals/cases or evals/private");
-const provider = await endpoint();
+// The model endpoint the reviews and the matching use: each setting from the environment, or else from .env.
+const endpoint = loadEndpoint({ ...parseEnvFile(await readFile(join(root, ".env"), "utf8").catch(() => "")), ...process.env });
 const runRoot = join(root, "runs/evals", options.name);
 const say = (message: string): void => console.error(`eval: ${message}`);
 
@@ -245,13 +223,13 @@ if (!options.scoreOnly) {
   for (const evalCase of cases) await prepare(evalCase, join(runRoot, evalCase.id), options.noPrior);
   const jobs = cases.flatMap((evalCase) => Array.from({ length: options.runs }, (_, index) => async () => {
     say(`reviewing ${evalCase.id}, run ${index + 1}`);
-    await review(evalCase, join(runRoot, evalCase.id), join(runRoot, evalCase.id, `run-${index + 1}`), options, provider);
+    await review(evalCase, join(runRoot, evalCase.id), join(runRoot, evalCase.id, `run-${index + 1}`), options, endpoint);
   }));
   await pool(jobs, options.jobs);
 }
 
 const judgeUsage = emptyUsage();
-const chat = createChat({ apiKey: provider.key, baseUrl: provider.baseUrl, api: provider.api, headers: provider.headers, effort: null, usage: judgeUsage });
+const chat = createChat({ ...endpoint, effort: null, usage: judgeUsage });
 const scores = [];
 const raw: Record<string, RunResult[]> = {};
 for (const evalCase of cases) {
