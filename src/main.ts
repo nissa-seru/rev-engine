@@ -61,7 +61,7 @@ async function writeTranscripts(): Promise<void> {
 }
 
 try {
-  const send = createChat({ apiKey: config.apiKey, baseUrl: config.baseUrl, effort: config.effort, usage, usageByCaller });
+  const send = createChat({ apiKey: config.apiKey, baseUrl: config.baseUrl, api: config.api, headers: config.headers, effort: config.effort, usage, usageByCaller });
   const chat: Chat = config.transcriptOutPath
     ? (request) => {
       transcripts.set(request.caller ?? request.model, { model: request.model, messages: request.messages });

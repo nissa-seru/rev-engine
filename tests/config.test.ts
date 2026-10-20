@@ -92,3 +92,22 @@ test("turns on the swarm prototype, but not together with the naive baseline", (
   assert.throws(() => loadConfig({ ...BASE, RB_CONFIG_SWARM: "yes" }), /RB_CONFIG_SWARM/);
   assert.throws(() => loadConfig({ ...BASE, RB_CONFIG_SWARM: "on", RB_CONFIG_NAIVE: "on" }), /cannot both be on/);
 });
+
+test("reads the model API and a key that is not OpenRouter's", () => {
+  assert.equal(loadConfig(BASE).api, "chat");
+  const { OPENROUTER_API_KEY: _, ...withoutOpenRouter } = BASE;
+  const config = loadConfig({ ...withoutOpenRouter, RB_MODEL_API: "anthropic", RB_MODEL_API_KEY: "other-key", RB_MODEL_BASE_URL: "http://127.0.0.1:9/anthropic" });
+  assert.equal(config.api, "anthropic");
+  assert.equal(config.apiKey, "other-key");
+  assert.equal(loadConfig({ ...BASE, RB_MODEL_API_KEY: "other-key" }).apiKey, "other-key");
+  assert.throws(() => loadConfig({ ...BASE, RB_MODEL_API: "responses" }), /RB_MODEL_API must be chat or anthropic/);
+  assert.throws(() => loadConfig(withoutOpenRouter), /missing OPENROUTER_API_KEY, or RB_MODEL_API_KEY/);
+});
+
+test("reads extra model request headers as a JSON object", () => {
+  assert.deepEqual(loadConfig(BASE).headers, {});
+  assert.deepEqual(loadConfig({ ...BASE, RB_MODEL_HEADERS: '{"x-class":"batch"}' }).headers, { "x-class": "batch" });
+  for (const bad of ["x-class: batch", '["x"]', '{"x-count":1}']) {
+    assert.throws(() => loadConfig({ ...BASE, RB_MODEL_HEADERS: bad }), /RB_MODEL_HEADERS must be a JSON object/, bad);
+  }
+});

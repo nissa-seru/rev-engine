@@ -1,6 +1,7 @@
 // Reads the agent contract's inputs and this reviewer's settings from the environment.
 import { dirname, join } from "node:path";
 import type { Severity } from "./findings.ts";
+import type { ModelApi } from "./llm.ts";
 import { FOCUS_NAMES } from "./prompts.ts";
 
 export type VerifyMode = "off" | "lenient" | "strict";
@@ -22,6 +23,10 @@ export interface Config {
   attempt: number;
   apiKey: string;
   baseUrl: string;
+  /** The API the endpoint at baseUrl speaks. */
+  api: ModelApi;
+  /** Extra headers for every model request. */
+  headers: Record<string, string>;
   /** One independent review seat per model. */
   models: string[];
   /** For each seat, the one focus it reviews for, or null for the full review. */
@@ -88,6 +93,21 @@ function integer(env: Env, name: string, fallback: number, min: number, max: num
   return value;
 }
 
+/** RB_MODEL_HEADERS: a JSON object of header names and string values. */
+export function modelHeaders(raw: string | undefined): Record<string, string> {
+  if (!raw?.trim()) return {};
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("RB_MODEL_HEADERS must be a JSON object of header names and string values");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.values(value).some((item) => typeof item !== "string")) {
+    throw new Error("RB_MODEL_HEADERS must be a JSON object of header names and string values");
+  }
+  return value as Record<string, string>;
+}
+
 export function loadConfig(env: Env): Config {
   const prNumber = Number(required(env, "RB_PR_NUMBER"));
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error("RB_PR_NUMBER is not a positive integer");
@@ -123,6 +143,12 @@ export function loadConfig(env: Env): Config {
 
   const outPath = required(env, "RB_OUT");
 
+  const api = (env.RB_MODEL_API?.trim() || "chat") as ModelApi;
+  if (!["chat", "anthropic"].includes(api)) throw new Error("RB_MODEL_API must be chat or anthropic");
+  const apiKey = env.RB_MODEL_API_KEY?.trim() || env.OPENROUTER_API_KEY?.trim();
+  if (!apiKey) throw new Error("missing OPENROUTER_API_KEY, or RB_MODEL_API_KEY");
+  const headers = modelHeaders(env.RB_MODEL_HEADERS);
+
   return {
     nwo: required(env, "RB_NWO"),
     prNumber,
@@ -135,8 +161,10 @@ export function loadConfig(env: Env): Config {
     priorJsonPath: env.RB_PRIOR_JSON?.trim() || "/work/pr/prior.json",
     outPath,
     attempt: integer(env, "RB_ATTEMPT", 1, 1, 1000),
-    apiKey: required(env, "OPENROUTER_API_KEY"),
+    apiKey,
     baseUrl: (env.RB_MODEL_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, ""),
+    api,
+    headers,
     models,
     focuses,
     verifierModel: env.RB_CONFIG_VERIFIER?.trim() || models[0]!,
