@@ -102,6 +102,11 @@ runs:
         } >> "$GITHUB_OUTPUT"
 
     # The token is not kept in the checkout, because the model can read files there.
+    # actions/checkout refuses a fork's code under pull_request_target unless told it may: the
+    # danger it guards against is running that code with the base repository's token and secrets.
+    # Nothing here runs it. git only fetches and diffs the tree, the review image is built from this
+    # action's own files, and the review container mounts the checkout read-only and only reads it.
+    # So a fork's pull request is checked out exactly when allow-forks says forks are reviewed.
     - name: Check out the pull request
       if: steps.ask.outputs.run == 'true'
       uses: actions/checkout@v4
@@ -111,6 +116,7 @@ runs:
         path: rev-engine-prime-checkout
         persist-credentials: false
         token: ${{ inputs.github-token }}
+        allow-unsafe-pr-checkout: ${{ inputs.allow-forks == 'true' }}
 
     - name: Write the diff
       if: steps.ask.outputs.run == 'true'
