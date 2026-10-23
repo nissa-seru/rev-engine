@@ -41,6 +41,28 @@ function tool(name: string, description: string, properties: Record<string, unkn
 const startLine = { type: "integer", minimum: 1, description: "First line to return, counting from 1." };
 const lineCount = { type: "integer", minimum: 1, maximum: MAX_READ_LINES, description: `How many lines to return, at most ${MAX_READ_LINES}.` };
 
+/** A pull request's own text, which is no file in the checkout. */
+export interface ChangeTexts {
+  description: string;
+  commitMessages: string;
+}
+
+/** Each change text by the name read_change_text takes, with the name a finding cites it by. */
+const CHANGE_TEXTS: Record<string, { text: keyof ChangeTexts; path: string }> = {
+  description: { text: "description", path: "change-text.md" },
+  "commit-messages": { text: "commitMessages", path: "commit-messages.txt" },
+};
+
+/**
+ * The tool that reads the pull request's description and commit messages. It is a tool of its own, not a path, so it
+ * can't hide a file of the repository that has a text's name.
+ */
+export const changeTextTool: ToolDefinition = tool("read_change_text", "Read a numbered slice of the pull request's description or its commit messages, which are not files in the repository.", {
+  which: { type: "string", enum: Object.keys(CHANGE_TEXTS), description: "description, or commit-messages." },
+  start_line: startLine,
+  line_count: lineCount,
+});
+
 export const readTools: ToolDefinition[] = [
   tool("read_diff", "Read a numbered slice of the pull request diff.", { start_line: startLine, line_count: lineCount }),
   tool("read_file", "Read a numbered slice of a text file as it is after the change. Line numbers match the ones findings must cite.", {
@@ -63,25 +85,27 @@ export const readTools: ToolDefinition[] = [
   }),
 ];
 
-function numberedSlice(text: string, start: unknown, count: unknown): { content: string; total_lines: number } {
+/**
+ * A numbered slice of a text, cut to MAX_READ_BYTES characters, and the lines it returned whole: a line the cut ends
+ * inside was returned only in part, and a reader paging on from the next line never sees its rest, so it isn't counted
+ * as read.
+ */
+function numberedSlice(text: string, start: unknown, count: unknown): { content: string; total_lines: number; returned: [number, number] | null } {
   const lines = text.split("\n");
   if (lines.at(-1) === "") lines.pop();
   const first = Math.max(1, Math.floor(Number(start)) || 1);
   const size = Math.max(1, Math.min(MAX_READ_LINES, Math.floor(Number(count)) || MAX_READ_LINES));
-  const content = lines.slice(first - 1, first - 1 + size)
-    .map((line, index) => `${first + index}: ${line}`).join("\n").slice(0, MAX_READ_BYTES);
-  return { content, total_lines: lines.length };
-}
-
-/** The first and last line numbers a slice actually returned, after any cut for size. */
-function sliceRange(content: string): [number, number] | null {
-  const numbers = content.split("\n").map((line) => Number(/^(\d+): /.exec(line)?.[1])).filter((value) => value > 0);
-  return numbers.length ? [numbers[0]!, numbers.at(-1)!] : null;
+  const joined = lines.slice(first - 1, first - 1 + size).map((line, index) => `${first + index}: ${line}`).join("\n");
+  const content = joined.slice(0, MAX_READ_BYTES);
+  // Every line given carries its "N: " prefix, so the character after a cut that falls at a line's end is the newline.
+  const whole = !joined ? 0 : content.split("\n").length - (content.length < joined.length && joined[content.length] !== "\n" ? 1 : 0);
+  return { content, total_lines: lines.length, returned: whole > 0 ? [first, first + whole - 1] : null };
 }
 
 /**
- * One thing a model looked at. Lines are file lines for read_file (at head) and
- * read_base_file (at base), and diff lines for read_diff. Paths and numbers only, never content.
+ * One thing a model looked at. Lines are the ones a read returned whole: file lines for read_file (at head) and
+ * read_base_file (at base), diff lines for read_diff, and the text's own lines for read_change_text, whose path is the
+ * name the text is cited by. Paths and numbers only, never content.
  */
 export interface ReadRecord {
   tool: string;
@@ -108,6 +132,7 @@ const SAFE_ERRORS = [
   "query is invalid",
   "tool output budget is exhausted",
   "file does not exist at the base revision",
+  "which is description or commit-messages",
 ];
 
 /** Errors go back to the model, so only known messages pass through; anything else could leak host details. */
@@ -127,10 +152,15 @@ export class Workspace {
   private outputBytes = 0;
   private root: string | null = null;
 
-  constructor(repoDir: string, diffPath: string, base: string) {
+  /** The pull request's description and commit messages, which read_change_text serves; none for a workspace without that tool. */
+  private readonly texts: ChangeTexts | null;
+
+  constructor(repoDir: string, diffPath: string, base: string, texts: ChangeTexts | null = null) {
     this.repoDir = repoDir;
     this.diffPath = diffPath;
     this.base = base;
+    // Served as they are numbered where they're cited: their own lines, with blank lines at the end left off.
+    this.texts = texts && { description: texts.description.trimEnd(), commitMessages: texts.commitMessages.trimEnd() };
   }
 
   private async canonicalRoot(): Promise<string> {
@@ -217,9 +247,13 @@ export class Workspace {
     return this.walk(await this.canonicalRoot(), limit);
   }
 
-  private record(entry: ReadRecord, content: string): void {
-    const lines = sliceRange(content);
-    this.reads.push(lines ? { ...entry, lines } : entry);
+  private record(entry: ReadRecord, slice: { returned: [number, number] | null }): void {
+    this.reads.push(slice.returned ? { ...entry, lines: slice.returned } : entry);
+  }
+
+  /** A numbered slice as the model is given it: the lines and the text's length, not what the record keeps. */
+  private shown(slice: { content: string; total_lines: number }): { ok: true; content: string; total_lines: number } {
+    return { ok: true, content: slice.content, total_lines: slice.total_lines };
   }
 
   private async search(query: unknown, path: unknown, ignoreCase: unknown): Promise<{ ok: true; results: Array<{ path: string; line: number; text: string }>; truncated: boolean; tooLarge?: string[]; tooLargeMore?: number }> {
@@ -254,17 +288,18 @@ export class Workspace {
   private async dispatch(name: string, args: Record<string, unknown>): Promise<unknown> {
     if (name === "read_diff") {
       const slice = numberedSlice(await this.diff(), args.start_line, args.line_count);
-      this.record({ tool: name }, slice.content);
-      return { ok: true, ...slice };
+      this.record({ tool: name }, slice);
+      return this.shown(slice);
     }
     if (name === "read_file") {
       const path = await this.contained(args.path);
       const text = await this.textFile(path);
-      const relativePath = safeRelativePath(args.path);
-      this.opened.add(relativePath);
+      // The file whose lines were returned: through a symlink or a path like src/./a.ts, the one it resolves to.
+      const returned = relative(await this.canonicalRoot(), path).split(sep).join("/");
+      this.opened.add(returned);
       const slice = numberedSlice(text, args.start_line, args.line_count);
-      this.record({ tool: name, path: relativePath }, slice.content);
-      return { ok: true, ...slice };
+      this.record({ tool: name, path: returned }, slice);
+      return this.shown(slice);
     }
     if (name === "read_base_file") {
       const text = await this.baseFile(String(args.path ?? ""));
@@ -272,8 +307,16 @@ export class Workspace {
       const relativePath = safeRelativePath(args.path);
       this.opened.add(relativePath);
       const slice = numberedSlice(text, args.start_line, args.line_count);
-      this.record({ tool: name, path: relativePath }, slice.content);
-      return { ok: true, ...slice };
+      this.record({ tool: name, path: relativePath }, slice);
+      return this.shown(slice);
+    }
+    if (name === "read_change_text" && this.texts) {
+      const which = String(args.which);
+      if (!Object.hasOwn(CHANGE_TEXTS, which)) throw new Error("which is description or commit-messages");
+      const cited = CHANGE_TEXTS[which]!;
+      const slice = numberedSlice(this.texts[cited.text], args.start_line, args.line_count);
+      this.record({ tool: name, path: cited.path }, slice);
+      return this.shown(slice);
     }
     if (name === "list_files") {
       const files = await this.walk(await this.contained(args.path ?? ""), MAX_LIST_FILES);

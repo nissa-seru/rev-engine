@@ -13,7 +13,7 @@ import { parseDiff, type OutputFinding } from "../findings.ts";
 import { ModelError, ModelRefused, ModelUnavailable, type Chat, type Usage } from "../llm.ts";
 import { loadPrior } from "../prior.ts";
 import { GENERATED, loadPullRequest, loadRules } from "../review.ts";
-import { safeRelativePath, Workspace } from "../tools.ts";
+import { safeRelativePath, Workspace, type ChangeTexts, type ReadRecord } from "../tools.ts";
 import { callsOf, numberedLines, runFind, TEXT_FILES, type Battery, type ChangeBrief, type FindAnswer } from "./find.ts";
 import { groupFindings } from "./group.ts";
 import { judgeIssues, type JudgeVerdict } from "./judge.ts";
@@ -92,9 +92,8 @@ export interface ShapeReview {
   notReal: Array<{ area: string; id: string; title: string; notRealKind: string; why: string; places: Place[] }>;
   decided: Array<{ area: string; id: string; title: string; repeatOf: string }>;
   unjudged: Array<{ area: string; id: string; title: string }>;
-  /** Changed files two or more finders said they couldn't cover, that no posted issue cites. */
-  unreadSpots: string[];
-  unread: Array<{ area: string; finder: string; unread: string[] }>;
+  /** The changed lines no finder's read returned, from what each finder's workspace recorded. */
+  unreadChanges: UnreadChanges;
   /** Finders that returned no finding, as area/battery:call. */
   empty: string[];
   /** haiku calls that gave no answer, as area/battery:call. */
@@ -107,7 +106,7 @@ export interface ShapeReview {
   problems: string[];
   /** The planner's note, such as generated files left out of every slice. */
   planNote: string;
-  /** Changed files in no area of a plan of several, left out as generated, vendored or lockfiles: no reader read them. */
+  /** Changed files in no area of a plan of several, which the review says beside any of their lines no reader read. */
   leftOut: string[];
   /** A project with a package.json whose dependencies weren't installed for the readers. */
   withoutDependencies?: boolean;
@@ -188,6 +187,36 @@ async function readJson<T>(path: string): Promise<T | null> {
   }
 }
 
+/**
+ * A path as a diff's --- or +++ line writes it, with its a/ or b/ still on. Git quotes a path that holds a double quote,
+ * a backslash or a control character (and, without core.quotePath=false, any byte past ASCII), writing those as C escapes
+ * with octal for raw bytes; the path the file tools read is the decoded one. A name it doesn't quote but that holds a
+ * space it follows with a tab, which isn't the name's, while a space at the name's end is.
+ */
+export function diffHeaderPath(text: string): string {
+  const written = text.endsWith("\t") ? text.slice(0, -1) : text;
+  if (written.length < 2 || !written.startsWith('"') || !written.endsWith('"')) return written;
+  const escapes: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+  const bytes: number[] = [];
+  const body = written.slice(1, -1);
+  for (let index = 0; index < body.length; index += 1) {
+    const octal = /^\\([0-3][0-7]{2})/.exec(body.slice(index));
+    if (octal) {
+      bytes.push(parseInt(octal[1]!, 8));
+      index += 3;
+    } else if (body[index] === "\\" && Object.hasOwn(escapes, body[index + 1] ?? "")) {
+      bytes.push(escapes[body[index + 1]!]!);
+      index += 1;
+    } else {
+      // One UTF-16 unit at a time would split a surrogate pair, so a character outside the basic plane goes whole.
+      const character = String.fromCodePoint(body.codePointAt(index)!);
+      bytes.push(...Buffer.from(character, "utf8"));
+      index += character.length - 1;
+    }
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
 /** For each changed file, the lines of the diff (as read_diff numbers them) its part spans, and its size in characters. */
 export function diffParts(diff: string): { lines: Map<string, [number, number]>; chars: Map<string, number> } {
   const lines = new Map<string, [number, number]>();
@@ -208,10 +237,10 @@ export function diffParts(diff: string): { lines: Map<string, [number, number]>;
       current = { path: header?.[2] ?? "", start: index + 1, size: 0, named: Boolean(header) };
     } else if (current && !current.named && text.startsWith("--- ")) {
       // A file the change deletes is named only here, since its +++ line is /dev/null.
-      const path = text.slice(4).trim().replace(/^"|"$/g, "");
+      const path = diffHeaderPath(text.slice(4));
       if (path !== "/dev/null") current.old = path.replace(/^a\//, "");
     } else if (current && !current.named && text.startsWith("+++ ")) {
-      const path = text.slice(4).trim().replace(/^"|"$/g, "");
+      const path = diffHeaderPath(text.slice(4));
       current.path = path !== "/dev/null" ? path.replace(/^b\//, "") : current.old ?? "";
       current.named = true;
     }
@@ -261,15 +290,112 @@ export function areaTasks(area: Area): Task[] {
   return [...area.tasks, ...area.questions.map((question, index) => ({ id: `q${index + 1}`, slice: { kind: "question" as const, question }, lenses: [] }))];
 }
 
-/** Whether a text names a path as a whole, not as part of a longer one (src/a.ts in src/a.tsx). */
-export function namesPath(text: string, path: string): boolean {
-  const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^\\w./-])${escaped}($|[^\\w./-]|\\.(?!\\w))`).test(text);
+/** The change's lines that no finder's read returned, which is what the review says it couldn't read. */
+export interface UnreadChanges {
+  /** The lines the diff adds or removes. */
+  changed: number;
+  /** How many of them no finder's read returned. */
+  unread: number;
+  /**
+   * Each file with such lines, in the diff's order: added lines by their line at head, removed ones by their line at the
+   * base, in the file the base names (basePath, when the change moved it).
+   */
+  files: Array<{ path: string; basePath?: string; added: Array<[number, number]>; removed: Array<[number, number]> }>;
 }
 
-/** Changed files that two or more finders name in what they couldn't cover, that no posted issue cites. */
-export function unreadSpots(changedFiles: string[], unread: Array<{ finder: string; unread: string[] }>, cited: Set<string>): string[] {
-  return changedFiles.filter((file) => !cited.has(file) && unread.filter((entry) => entry.unread.some((text) => namesPath(text, file))).length >= 2);
+/** Runs of consecutive line numbers, as ranges. */
+function runsOf(numbers: number[]): Array<[number, number]> {
+  const runs: Array<[number, number]> = [];
+  for (const number of numbers) {
+    const last = runs.at(-1);
+    if (last && number === last[1] + 1) last[1] = number;
+    else runs.push([number, number]);
+  }
+  return runs;
+}
+
+/**
+ * The diff's added and removed lines that no read returned. An added line is read when a read of the diff (read_diff)
+ * or of its file at head (read_file) returned it, a removed one when a read of the diff did. A read at the base doesn't
+ * count for a removed line: a first review's diff runs from the merge base, while read_base_file reads the base branch's
+ * tip, whose line numbers needn't be the diff's. A search hit isn't reading a line, and nor is listing files. The reads
+ * are every finder's that gave an answer, of both batteries and every area: the review read a line if any of its
+ * readers did.
+ */
+export function unreadChanges(diff: string, reads: ReadRecord[]): UnreadChanges {
+  const lines = diff.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const shown = new Uint8Array(lines.length + 1);
+  const atHead = new Map<string, Array<[number, number]>>();
+  for (const read of reads) {
+    if (!read.lines) continue;
+    const [from, to] = read.lines;
+    // A record's lines start at 1, and fill stops at the array's end, as the read did at the diff's.
+    if (read.tool === "read_diff") shown.fill(1, from, to + 1);
+    if (read.tool === "read_file" && read.path) atHead.set(read.path, [...(atHead.get(read.path) ?? []), read.lines]);
+  }
+  const within = (ranges: Array<[number, number]> | undefined, line: number): boolean => (ranges ?? []).some(([from, to]) => from <= line && line <= to);
+  const named = (text: string): string | null => {
+    const path = diffHeaderPath(text.slice(4));
+    return path === "/dev/null" ? null : path.replace(/^[ab]\//, "");
+  };
+  const result: UnreadChanges = { changed: 0, unread: 0, files: [] };
+  // One file's part of the diff: its paths, from its --- and +++ lines, and its unread lines so far.
+  let part: { base: string | null; head: string | null; added: number[]; removed: number[] } | null = null;
+  let inHunk = false;
+  let head = 0;
+  let base = 0;
+  const close = (): void => {
+    if (!part || (!part.added.length && !part.removed.length)) return;
+    const path = part.head ?? part.base ?? "";
+    result.files.push({
+      path, ...(part.base && part.base !== path ? { basePath: part.base } : {}), added: runsOf(part.added), removed: runsOf(part.removed),
+    });
+  };
+  for (const [index, text] of lines.entries()) {
+    if (text.startsWith("diff --git ")) {
+      close();
+      part = { base: null, head: null, added: [], removed: [] };
+      inHunk = false;
+      continue;
+    }
+    if (!part) continue;
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
+    if (hunk) {
+      inHunk = true;
+      base = Number(hunk[1]);
+      head = Number(hunk[2]);
+      continue;
+    }
+    if (!inHunk) {
+      // A file's header names it: before its first hunk, a --- or +++ line is a path, not a removed or added line.
+      if (text.startsWith("--- ")) part.base = named(text);
+      else if (text.startsWith("+++ ")) part.head = named(text);
+      continue;
+    }
+    const diffLine = index + 1;
+    if (text.startsWith("+")) {
+      result.changed += 1;
+      if (!shown[diffLine] && !within(atHead.get(part.head ?? ""), head)) {
+        part.added.push(head);
+        result.unread += 1;
+      }
+      head += 1;
+    } else if (text.startsWith("-")) {
+      result.changed += 1;
+      if (!shown[diffLine]) {
+        part.removed.push(base);
+        result.unread += 1;
+      }
+      base += 1;
+    } else if (!text.startsWith("\\")) {
+      // A context line; "\ No newline at end of file" is neither side's line.
+      head += 1;
+      base += 1;
+    }
+  }
+  close();
+  return result;
 }
 
 function areaDir(run: ShapeRun, plan: Plan, area: Area): string {
@@ -277,7 +403,7 @@ function areaDir(run: ShapeRun, plan: Plan, area: Area): string {
 }
 
 /** Each kept answer of one area of an earlier run, by battery and call. One that can't be read is said, and asked again. */
-async function keptAnswers(dir: string | null, log: (message: string) => void): Promise<FindAnswer[]> {
+export async function keptAnswers(dir: string | null, log: (message: string) => void): Promise<FindAnswer[]> {
   if (!dir) return [];
   let names: string[];
   try {
@@ -289,7 +415,11 @@ async function keptAnswers(dir: string | null, log: (message: string) => void): 
   const answers: FindAnswer[] = [];
   for (const name of names.filter((entry) => entry.endsWith(".json")).sort()) {
     const answer = await readJson<FindAnswer>(join(dir, "answers", name));
-    if (answer && typeof answer.battery === "string" && typeof answer.call === "string" && Array.isArray(answer.findings)) answers.push(answer);
+    const readable = answer && typeof answer.battery === "string" && typeof answer.call === "string" && Array.isArray(answer.findings);
+    if (readable && Array.isArray(answer.reads)) answers.push(answer);
+    // An answer kept before answers held their reads can't say what its finder read, and the review counts what its
+    // readers read, so its call is asked again.
+    else if (readable) log(`the kept answer ${join(dir, "answers", name)} holds no reads, so its call is asked again`);
     else log(`the kept answer ${join(dir, "answers", name)} can't be read, so its call is asked again`);
   }
   log(`${answers.length} kept answer(s) read from ${join(dir, "answers")}`);
@@ -329,7 +459,8 @@ export async function shapeReview(options: ShapeOptions): Promise<ShapeOutcome> 
 async function reviewStages(options: ShapeOptions, started: number, deadline: number): Promise<ShapeOutcome> {
   const { config, claude, sol, run, log } = options;
   const opus = config.models[0]!;
-  const workspace = (): Workspace => new Workspace(config.repoDir, config.diffPath, config.base);
+  // A finder's workspace serves the change's description and commit messages too; the planner's and the judge's don't.
+  const workspace = (texts: ChangeTexts | null = null): Workspace => new Workspace(config.repoDir, config.diffPath, config.base, texts);
   const main = workspace();
   // Project rules as the pull request's base has them, which in a later round isn't the base the review reads from.
   const rulesBase = config.shape?.rulesBase ?? config.base;
@@ -547,7 +678,7 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   for (const { area, judging } of judged) {
     if (judging.unjudged.length && judging.errors.length) problems.push(`The judge${plan.areas.length > 1 ? ` (area ${area.name})` : ""} gave no verdict on ${judging.unjudged.length} issue(s); its calls that failed along the way failed with ${judging.errors.join("; ")}.`);
   }
-  const review = assembleReview(run, config.head, config.base, { planner: opus, batteryA: SHAPE_MODELS.sol, batteryB: SHAPE_MODELS.haiku, judge: opus }, judged, plan, problems, changedFiles, key);
+  const review = assembleReview(run, config.head, config.base, { planner: opus, batteryA: SHAPE_MODELS.sol, batteryB: SHAPE_MODELS.haiku, judge: opus }, judged, plan, problems, changedFiles, key, diff);
   // The maintainers' decisions this review collected go to its first area's run directory, which the store keys them by.
   const decided = await readFile(join(dirname(config.priorJsonPath), "decisions.jsonl"), "utf8").catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "ENOENT") log(`the maintainers' decisions couldn't be read, so the run directory goes without them: ${describe(error)}`);
@@ -566,7 +697,7 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   return { stop: null, findings: review.issues.flatMap((issue) => toFinding(issue, config.agent) ?? []), review };
 }
 
-interface AreaResult {
+export interface AreaResult {
   area: Area;
   answers: FindAnswer[];
   failed: Array<{ battery: string; call: string; error: unknown }>;
@@ -575,9 +706,13 @@ interface AreaResult {
   all: Finding[];
 }
 
-function assembleReview(run: ShapeRun, head: string, base: string, models: ShapeReview["models"], results: AreaResult[], plan: Plan, problems: string[], changedFiles: string[], key: (area: string, id: string) => string): ShapeReview {
+/** The review as posted: every area's issues by the judge's verdict, how its readers went, and what they read of the diff. */
+export function assembleReview(run: ShapeRun, head: string, base: string, models: ShapeReview["models"], results: AreaResult[], plan: Plan, problems: string[], changedFiles: string[], key: (area: string, id: string) => string, diff: string): ShapeReview {
   const review: ShapeReview = {
-    label: run.label, head, base, roundOf: run.roundOf, models, issues: [], notReal: [], decided: [], unjudged: [], unreadSpots: [], unread: [], empty: [], shortfall: [], bounded: [], dropped: 0,
+    label: run.label, head, base, roundOf: run.roundOf, models, issues: [], notReal: [], decided: [], unjudged: [],
+    // Every answer of every area, both batteries': a line any of the review's readers read, the review read.
+    unreadChanges: unreadChanges(diff, results.flatMap((result) => result.answers).flatMap((answer) => answer.reads)),
+    empty: [], shortfall: [], bounded: [], dropped: 0,
     problems: [...problems], planNote: plan.note,
     leftOut: plan.areas.length > 1 ? changedFiles.filter((file) => !plan.areas.some((area) => area.files.includes(file) || area.tasks.some((task) => (task.slice.files ?? []).some((entry) => entry.replace(/:[0-9]+-[0-9]+$/, "") === file)))) : [],
   };
@@ -603,7 +738,6 @@ function assembleReview(run: ShapeRun, head: string, base: string, models: Shape
     for (const answer of answers) {
       const finder = `${plan.areas.length > 1 ? `${area.name}/` : ""}${answer.battery}:${answer.call}`;
       if (!answer.findings.length) review.empty.push(finder);
-      if (answer.unread.length) review.unread.push({ area: area.name, finder, unread: answer.unread });
       if (answer.bounded) review.bounded.push(finder);
       review.dropped += answer.dropped;
     }
@@ -611,8 +745,6 @@ function assembleReview(run: ShapeRun, head: string, base: string, models: Shape
     for (const problem of grouping.problems) review.problems.push(`Grouping${plan.areas.length > 1 ? ` (area ${area.name})` : ""}: ${problem}.`);
   }
   review.issues.sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
-  const cited = new Set(review.issues.flatMap((issue) => issue.places.map((spot) => spot.file)));
-  review.unreadSpots = unreadSpots(changedFiles, review.unread, cited);
   return review;
 }
 

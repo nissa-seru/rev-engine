@@ -4,14 +4,14 @@ import { mkdirSync, mkdtempSync, symlinkSync, truncateSync, writeFileSync } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Workspace } from "../src/tools.ts";
+import { Workspace, type ChangeTexts } from "../src/tools.ts";
 import { loadRules } from "../src/review.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" }).trim();
 }
 
-function fixture(): { workspace: Workspace; root: string } {
+function fixture(texts: ChangeTexts | null = null): { workspace: Workspace; root: string } {
   const root = mkdtempSync(join(tmpdir(), "rep-tools-"));
   const repo = join(root, "repo");
   mkdirSync(join(repo, "src"), { recursive: true });
@@ -27,7 +27,7 @@ function fixture(): { workspace: Workspace; root: string } {
   mkdirSync(join(repo, "node_modules", "dep"), { recursive: true });
   writeFileSync(join(repo, "node_modules", "dep", "index.js"), "NEEDLE\n");
   writeFileSync(join(root, "diff.patch"), "d1\nd2\nd3\n");
-  return { workspace: new Workspace(repo, join(root, "diff.patch"), base), root };
+  return { workspace: new Workspace(repo, join(root, "diff.patch"), base, texts), root };
 }
 
 async function call(workspace: Workspace, name: string, args: unknown): Promise<any> {
@@ -138,3 +138,71 @@ test("bad arguments and unknown tools return errors instead of throwing", async 
   assert.equal(JSON.parse(await workspace.call("read_file", "{not json")).error, "arguments must be a JSON object");
   assert.equal((await call(workspace, "run_shell", { command: "id" })).error, "unknown tool");
 });
+
+test("read_change_text serves the change's texts as they're cited, and a repository file of a text's name stays the repository's", async () => {
+  const { workspace, root } = fixture({ description: "first\nsecond\n\n\n", commitMessages: "--- commit abc\nthe message" });
+  writeFileSync(join(root, "repo", "change-text.md"), "the repository's own\n");
+  assert.deepEqual(await call(workspace, "read_change_text", { which: "description", start_line: 1, line_count: 400 }), { ok: true, content: "1: first\n2: second", total_lines: 2 }, "blank lines at its end left off, as a citation counts them");
+  assert.deepEqual(await call(workspace, "read_change_text", { which: "commit-messages", start_line: 2, line_count: 1 }), { ok: true, content: "2: the message", total_lines: 2 });
+  assert.deepEqual(await call(workspace, "read_file", { path: "change-text.md", start_line: 1, line_count: 10 }), { ok: true, content: "1: the repository's own", total_lines: 1 });
+  assert.equal((await call(workspace, "read_change_text", { which: "constructor", start_line: 1, line_count: 1 })).error, "which is description or commit-messages");
+  assert.deepEqual(workspace.reads, [
+    { tool: "read_change_text", path: "change-text.md", lines: [1, 2] },
+    { tool: "read_change_text", path: "commit-messages.txt", lines: [2, 2] },
+    { tool: "read_file", path: "change-text.md", lines: [1, 1] },
+  ]);
+  const plain = fixture().workspace;
+  assert.equal((await call(plain, "read_change_text", { which: "description", start_line: 1, line_count: 1 })).error, "unknown tool", "a workspace given no texts doesn't serve them");
+  assert.deepEqual(plain.reads, []);
+});
+
+test("a read cut at its size records only the lines it returned whole", async () => {
+  const { workspace, root } = fixture();
+  // Three lines of 20,000 characters: the cut at 48,000 ends inside the third, which a reader paging on never sees whole.
+  writeFileSync(join(root, "repo", "src", "long.ts"), ["a", "b", "c"].map((letter) => letter.repeat(20_000)).join("\n") + "\n");
+  const long = await call(workspace, "read_file", { path: "src/long.ts", start_line: 1, line_count: 3 });
+  assert.equal(long.content.length, 48_000);
+  assert.match(long.content, /\n3: c+$/, "the third line was returned in part");
+  assert.deepEqual(workspace.reads.at(-1), { tool: "read_file", path: "src/long.ts", lines: [1, 2] });
+  // "1: " and 23,996 characters, a newline, then "2: " and 23,997: the cut falls just at the second line's end.
+  writeFileSync(join(root, "repo", "src", "even.ts"), ["a".repeat(23_996), "b".repeat(23_997), "c"].join("\n") + "\n");
+  const even = await call(workspace, "read_file", { path: "src/even.ts", start_line: 1, line_count: 3 });
+  assert.match(even.content, /\n2: b{23997}$/);
+  assert.deepEqual(workspace.reads.at(-1), { tool: "read_file", path: "src/even.ts", lines: [1, 2] }, "a line the cut ends just after was returned whole");
+  writeFileSync(join(root, "repo", "src", "one.ts"), `${"z".repeat(60_000)}\n`);
+  await call(workspace, "read_file", { path: "src/one.ts", start_line: 1, line_count: 1 });
+  assert.deepEqual(workspace.reads.at(-1), { tool: "read_file", path: "src/one.ts" }, "a first line longer than the cut returned no line whole");
+});
+
+test("a read at head is recorded under the file it returned: a symlink's target, a path with a ./ in it", async () => {
+  const { workspace, root } = fixture();
+  symlinkSync("src/a.ts", join(root, "repo", "alias.ts"));
+  await call(workspace, "read_file", { path: "alias.ts", start_line: 1, line_count: 1 });
+  await call(workspace, "read_file", { path: "src/./a.ts", start_line: 2, line_count: 1 });
+  // git finds no src/./a.ts at the base, so that read returns nothing and records nothing under a name no diff has.
+  assert.equal((await call(workspace, "read_base_file", { path: "src/./a.ts", start_line: 1, line_count: 1 })).error, "file does not exist at the base revision");
+  assert.deepEqual(workspace.reads, [
+    { tool: "read_file", path: "src/a.ts", lines: [1, 1] },
+    { tool: "read_file", path: "src/a.ts", lines: [2, 2] },
+  ]);
+  assert.deepEqual([...workspace.opened], ["src/a.ts"], "opened names the read as reads does");
+  // A checkout reached through a symlink records paths inside it, not ../ out of the link.
+  symlinkSync(join(root, "repo"), join(root, "linked"));
+  const linked = new Workspace(join(root, "linked"), join(root, "diff.patch"), workspace.base);
+  await call(linked, "read_file", { path: "src/a.ts", start_line: 1, line_count: 1 });
+  assert.deepEqual(linked.reads, [{ tool: "read_file", path: "src/a.ts", lines: [1, 1] }]);
+});
+
+test("a read that returns no line records no lines: an empty text, or a start past the end", async () => {
+  const { workspace } = fixture({ description: "", commitMessages: "one" });
+  const empty = await call(workspace, "read_change_text", { which: "description", start_line: 1, line_count: 10 });
+  assert.deepEqual(empty, { ok: true, content: "", total_lines: 0 });
+  await call(workspace, "read_file", { path: "src/a.ts", start_line: 99, line_count: 10 });
+  await call(workspace, "read_change_text", { which: "commit-messages", start_line: 2, line_count: 10 });
+  assert.deepEqual(workspace.reads, [
+    { tool: "read_change_text", path: "change-text.md" },
+    { tool: "read_file", path: "src/a.ts" },
+    { tool: "read_change_text", path: "commit-messages.txt" },
+  ]);
+});
+

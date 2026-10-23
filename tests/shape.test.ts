@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runAgent } from "../src/agent.ts";
 import { ModelError, ModelRefused, ModelUnavailable, type Chat, type ChatMessage, type ChatRequest } from "../src/llm.ts";
-import { Workspace, type ToolDefinition } from "../src/tools.ts";
-import { callPrompt, callsOf, checkedFindings, numbered, numberedLines, runFind, taskBrief, type Battery, type ChangeBrief } from "../src/shape/find.ts";
+import { Workspace, type ReadRecord, type ToolDefinition } from "../src/tools.ts";
+import { callPrompt, callsOf, checkedFindings, numbered, numberedLines, runFind, taskBrief, type Battery, type ChangeBrief, type FindAnswer } from "../src/shape/find.ts";
 import { checkGrouping, groupFindings, numberIssues } from "../src/shape/group.ts";
 import { judgeIssues, parseVerdicts } from "../src/shape/judge.ts";
 import { checkPlan, repairPlan, type Lens, type Plan, type PlanContext } from "../src/shape/plan.ts";
-import { decidingFailure, diffParts, keptPlanOf, leftToSource, namesPath, shownPlace, stopFor, stopReasonOf, surroundings, toFinding, unreadSpots, type PostedIssue, type StopReason } from "../src/shape/run.ts";
+import { assembleReview, decidingFailure, diffHeaderPath, diffParts, keptAnswers, keptPlanOf, leftToSource, shownPlace, stopFor, stopReasonOf, surroundings, toFinding, unreadChanges, type PostedIssue, type StopReason } from "../src/shape/run.ts";
 import { mkdirSync as makeDir, mkdtempSync as makeTemp, writeFileSync as writeTo } from "node:fs";
 import { tmpdir as tempRoot } from "node:os";
 import { join as joinPath } from "node:path";
@@ -253,7 +253,7 @@ const posted = (id: string, severity: PostedIssue["severity"], line = 11, reader
 function shapeReview(issues: PostedIssue[], extra: Partial<ShapeReview> = {}): ShapeReview {
   return {
     label: "re-o.n-1-1", head: "abcdef0123456789", models: { planner: "opus", batteryA: "sol", batteryB: "haiku", judge: "opus" }, issues,
-    notReal: [], decided: [], unjudged: [], unreadSpots: [], unread: [], empty: [], shortfall: [], bounded: [], dropped: 0, problems: [], planNote: "", leftOut: [],
+    notReal: [], decided: [], unjudged: [], unreadChanges: { changed: 4, unread: 0, files: [] }, empty: [], shortfall: [], bounded: [], dropped: 0, problems: [], planNote: "", leftOut: [],
     base: "0123456789abcdef", roundOf: null, ...extra,
   };
 }
@@ -268,7 +268,7 @@ test("the review comments on blockers and should-fix issues a hunk shows, and li
   assert.match(parts.comments[1]!.body, /Found by haiku alone\./);
   const order = ["#### Blockers (1)", "#### Should fix (2)", "#### Minor (1)", "#### What the review couldn't read"].map((heading) => parts.body.indexOf(heading));
   assert.ok(order.every((at, index) => at >= 0 && (index === 0 || at > order[index - 1]!)), "grouped by severity, most severe first");
-  assert.match(parts.body, /\*\*haiku gave no answer for 1 task: B:t2\.\*\*/);
+  assert.match(parts.body, /\*\*haiku gave no answer for 1 task: B:t2\.\*\* Those tasks were answered by sol alone\./);
   assert.doesNotMatch(parts.body, /Not it|not to be real|guarded/, "an issue the judge held not real isn't shown");
   assert.match(parts.body, /\*\*Recommendation: fix, then merge\.\*\* 1 blocker should be fixed first\./);
   const advice = buildShapeReview({ review: shapeReview([posted("I1", "should-fix"), posted("I2", "minor"), { ...posted("I3", "blocker"), verdict: "unsure" }]), hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 10 });
@@ -294,12 +294,6 @@ test("a long review is made compact, then cut, and stays inside the size GitHub 
 test("the findings file gives each issue at its first place in a repository file", () => {
   const issue = { ...posted("I1", "minor"), places: [{ file: "change-text.md", line: 2 }, { file: "src/a.ts", line: 11 }] };
   assert.deepEqual(toFinding(issue, "p"), { file: "src/a.ts", start_line: 11, end_line: 11, message: "Issue I1. Cause: the cause. Consequence: the effect. Case: the case", producer: "p" });
-});
-
-test("a changed file is an unread spot when two finders name it and no issue cites it", () => {
-  const unread = [{ finder: "A:x", unread: ["src/b.ts past line 300"] }, { finder: "B:x", unread: ["could not open src/b.ts"] }, { finder: "B:y", unread: ["src/a.ts"] }];
-  assert.deepEqual(unreadSpots(["src/a.ts", "src/b.ts"], unread, new Set()), ["src/b.ts"]);
-  assert.deepEqual(unreadSpots(["src/b.ts"], unread, new Set(["src/b.ts"])), []);
 });
 
 test("a failure stops the review for its reason, a refusal by its category alone, and at the limit as the limit", () => {
@@ -334,7 +328,7 @@ test("a quoted file name in the diff is mapped by its +++ line", () => {
   const quoted = `diff --git "a/my file.ts" "b/my file.ts"\nindex 1..2 100644\n--- "a/my file.ts"\n+++ "b/my file.ts"\n@@ -1 +1 @@\n-a\n+b\n`;
   assert.deepEqual([...diffParts(quoted).lines], [["my file.ts", [1, 7]]]);
   const deleted = `diff --git "a/caf\\303\\251.ts" "b/caf\\303\\251.ts"\ndeleted file mode 100644\nindex 1..0\n--- "a/caf\\303\\251.ts"\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n`;
-  assert.deepEqual([...diffParts(deleted).lines].map(([path]) => path), ["caf\\303\\251.ts"], "a deleted file is named by its --- line");
+  assert.deepEqual([...diffParts(deleted).lines].map(([path]) => path), ["café.ts"], "a deleted file is named by its --- line, its quoted name decoded as the file tools spell it");
 });
 
 test("a text is numbered from its own first line, and an empty one has no line to cite", () => {
@@ -508,7 +502,7 @@ test("malformed findings are counted as dropped, and a real top-level a/ directo
 
 test("a kept answer to no call of the plan is set aside, and an answer that can't be kept is still the run's", async () => {
   const haiku: Battery = { letter: "B", model: "haiku", effort: null, perCall: 1, contextTokens: 90_000, countdown: false };
-  const stale = { battery: "B", call: "old", findings: [], unread: [], note: "", bounded: false, dropped: 0 };
+  const stale = { battery: "B", call: "old", findings: [], unread: [], note: "", bounded: false, dropped: 0, reads: [] };
   const { chat, requests } = scripted([submit("submit_findings", { findings: [], unread: [], note: "" })]);
   const logs: string[] = [];
   const outcome = await runFind({
@@ -519,16 +513,6 @@ test("a kept answer to no call of the plan is set aside, and an answer that can'
   assert.deepEqual(outcome.answers.map((answer) => answer.call), ["t"]);
   assert.deepEqual(outcome.failed, []);
   assert.ok(logs.some((message) => message.includes("couldn't be kept for a resume: disk full")));
-});
-
-test("a path is named only as a whole, not inside a longer one", () => {
-  assert.ok(namesPath("could not read src/a.ts.", "src/a.ts"));
-  assert.ok(namesPath("(src/a.ts:30)", "src/a.ts"));
-  assert.ok(!namesPath("src/a.tsx past line 300", "src/a.ts"));
-  assert.ok(!namesPath("src/a.ts.bak", "src/a.ts"));
-  assert.ok(!namesPath("lib/src/a.ts", "src/a.ts"));
-  const unread = [{ finder: "A:x", unread: ["src/a.tsx"] }, { finder: "B:x", unread: ["src/a.tsx past 300"] }];
-  assert.deepEqual(unreadSpots(["src/a.ts", "src/a.tsx"], unread, new Set()), ["src/a.tsx"]);
 });
 
 test("an issue is shown at its first place in the repository at head: never a deleted file, a dependency or the change's text", () => {
@@ -547,7 +531,7 @@ test("model text can't carry a marker, a comment sits at the first of its places
   assert.deepEqual(markedIssue(`<!-- rev-engine-shape-issue re-x-1-1 I9 -->\n${parts.comments[0]!.body}`), { label: "re-o.n-1-1", issue: "I1" }, "a comment's own marker is its last");
   assert.doesNotMatch(parts.body, /<!-- rev-engine-shape-issue/);
   assert.match(parts.body, /Reviewed commit abcdef0, reading only what changed since fedcba9, the commit the earlier review re-o\.n-1-1 read,/);
-  assert.match(parts.body, /1 issue the judge gave no verdict on isn't weighed here\. 1 task one of the two readers didn't answer was read once, not twice\. It covers only what changed since fedcba9/);
+  assert.match(parts.body, /1 issue the judge gave no verdict on isn't weighed here\. 1 task one of the two readers didn't answer was answered once, not twice\. It covers only what changed since fedcba9/);
   const none = buildShapeReview({ review, hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 0 });
   assert.deepEqual(none.comments, [], "the rejected-comment fallback posts the summary alone");
 });
@@ -688,4 +672,210 @@ test("a comment too long for GitHub is cut, naming the artifact that holds it wh
   const body = shapeCommentBody({ ...posted("I1", "blocker"), failingCase: "x".repeat(30_000) }, shapeReview([]));
   assert.ok(body.length < 21_000);
   assert.match(body, /\.\.\. \(cut; the `rev-engine-shape-NUMBER-ROUND` artifact of this review's Actions run, named by the pull request and round, holds it whole\)/);
+});
+
+const UNREAD_DIFF = [
+  "diff --git a/src/a.ts b/src/a.ts",
+  "index 1111111..2222222 100644",
+  "--- a/src/a.ts",
+  "+++ b/src/a.ts",
+  "@@ -10,4 +10,5 @@ function a() {",
+  " context", // diff line 6: base 10, head 10
+  "-old eleven", // 7: base 11
+  "-old twelve", // 8: base 12
+  "+new eleven", // 9: head 11
+  "+new twelve", // 10: head 12
+  "+new thirteen", // 11: head 13
+  " context", // 12: base 13, head 14
+  "@@ -40,2 +41,3 @@",
+  " context", // 14: base 40, head 41
+  "+++ an added line that reads like a header", // 15: head 42
+  "--- a removed line that reads like a header", // 16: base 41
+  "\\ No newline at end of file", // 17: neither side's line
+  "+new last", // 18: head 43
+  "diff --git a/old.ts b/new.ts",
+  "similarity index 50%",
+  "rename from old.ts",
+  "rename to new.ts",
+  "--- a/old.ts",
+  "+++ b/new.ts",
+  "@@ -1,2 +1,2 @@",
+  "-gone", // 26: old.ts at the base, line 1
+  "+come", // 27: new.ts at head, line 1
+  " same",
+  "diff --git a/del.ts b/del.ts",
+  "deleted file mode 100644",
+  "index 3333333..0000000",
+  "--- a/del.ts",
+  "+++ /dev/null",
+  "@@ -1,2 +0,0 @@",
+  "-first", // 35: base 1
+  "-second", // 36: base 2
+  "",
+].join("\n");
+
+test("the changed lines no finder's read returned are found by file: added ones at head, removed ones at the base", () => {
+  const unread = unreadChanges(UNREAD_DIFF, [
+    { tool: "read_diff", lines: [9, 10] },
+    { tool: "read_file", path: "src/a.ts", lines: [13, 13] },
+    { tool: "read_file", path: "src/a.ts", lines: [43, 43] },
+    { tool: "read_base_file", path: "src/a.ts", lines: [11, 11] },
+    { tool: "search", query: "header", hits: [{ path: "src/a.ts", line: 42 }] },
+    { tool: "read_base_file", path: "new.ts", lines: [1, 1] },
+    { tool: "read_diff", lines: [35, 35] },
+    { tool: "read_change_text", path: "change-text.md", lines: [1, 50] },
+    { tool: "list_files", path: "" },
+    { tool: "read_file", path: "src/a.ts" },
+    // Head lines 12 and 41 are added and context lines; the base's 12 and 41 are removed lines a read at head never returned.
+    { tool: "read_file", path: "src/a.ts", lines: [12, 12] },
+    { tool: "read_file", path: "src/a.ts", lines: [41, 41] },
+  ]);
+  assert.deepEqual(unread, {
+    changed: 12,
+    unread: 7,
+    files: [
+      { path: "src/a.ts", added: [[42, 42]], removed: [[11, 12], [41, 41]] },
+      { path: "new.ts", basePath: "old.ts", added: [[1, 1]], removed: [[1, 1]] },
+      { path: "del.ts", added: [], removed: [[2, 2]] },
+    ],
+  }, "a search hit isn't a read, a read at the base or at head doesn't read a removed line, and the marker for a missing newline is no line");
+  assert.deepEqual(unreadChanges(DIFF, []), { changed: 4, unread: 4, files: [{ path: "src/a.ts", added: [[11, 12]], removed: [] }, { path: "test/a.test.ts", added: [[1, 2]], removed: [] }] });
+  assert.deepEqual(unreadChanges(DIFF, [{ tool: "read_diff", lines: [1, 400] }]), { changed: 4, unread: 0, files: [] }, "a read past the diff's end reads to its end");
+  const moved = unreadChanges(UNREAD_DIFF, [{ tool: "read_diff", lines: [1, 25] }, { tool: "read_diff", lines: [27, 400] }, { tool: "read_base_file", path: "old.ts", lines: [1, 1] }]);
+  assert.deepEqual(moved, { changed: 12, unread: 1, files: [{ path: "new.ts", basePath: "old.ts", added: [], removed: [[1, 1]] }] }, "a removed line is read only in the diff, not at the base, even under a moved file's old name");
+  assert.deepEqual(unreadChanges(UNREAD_DIFF, [{ tool: "read_diff", lines: [1, 400] }]), { changed: 12, unread: 0, files: [] });
+  // A repository file named as a change text is: git leaves out a hunk's count of one line.
+  const named = "diff --git a/change-text.md b/change-text.md\nindex 1..2 100644\n--- a/change-text.md\n+++ b/change-text.md\n@@ -1 +1 @@\n-old\n+new\n";
+  assert.deepEqual(unreadChanges(named, [{ tool: "read_change_text", path: "change-text.md", lines: [1, 5] }]), { changed: 2, unread: 2, files: [{ path: "change-text.md", added: [[1, 1]], removed: [[1, 1]] }] }, "reading the pull request's text reads none of a repository file of that name");
+  assert.deepEqual(unreadChanges(named, [{ tool: "read_file", path: "change-text.md", lines: [1, 1] }]).unread, 1);
+  // Git quotes a name holding a quote, a backslash or a tab, and writes them as escapes.
+  const quoted = `diff --git "a/we\\"ird\\tname.ts" "b/we\\"ird\\tname.ts"\nindex 1..2 100644\n--- "a/we\\"ird\\tname.ts"\n+++ "b/we\\"ird\\tname.ts"\n@@ -1 +1 @@\n-old\n+new\n`;
+  assert.deepEqual(unreadChanges(quoted, [{ tool: "read_file", path: 'we"ird\tname.ts', lines: [1, 1] }]), { changed: 2, unread: 1, files: [{ path: 'we"ird\tname.ts', added: [], removed: [[1, 1]] }] });
+  // Without core.quotePath=false git writes a name past ASCII as octal bytes.
+  const octal = `diff --git "a/caf\\303\\251.ts" "b/caf\\303\\251.ts"\nindex 1..2 100644\n--- "a/caf\\303\\251.ts"\n+++ "b/caf\\303\\251.ts"\n@@ -1 +1,2 @@\n one\n+two\n`;
+  assert.deepEqual(unreadChanges(octal, [{ tool: "read_file", path: "café.ts", lines: [1, 2] }]), { changed: 1, unread: 0, files: [] });
+});
+
+test("a diff header's quoted path is decoded as git escapes it", () => {
+  assert.equal(diffHeaderPath('"b/caf\\303\\251 \\"\\\\\\t.ts"'), 'b/café "\\\t.ts', "as a +++ line writes it after its four characters");
+  assert.equal(diffHeaderPath("b/plain name.ts"), "b/plain name.ts");
+  assert.equal(diffHeaderPath('"b/\u{1F600}.ts"'), "b/\u{1F600}.ts", "a character outside the basic plane passes whole");
+  assert.equal(diffHeaderPath('"'), '"');
+  assert.equal(diffHeaderPath('"b/\\a\\b\\n\\v\\f\\r"'), "b/\x07\b\n\v\f\r", "every escape git writes for a control character");
+  // A name holding a space is written unquoted and followed by a tab; a space at its end is the name's own.
+  assert.equal(diffHeaderPath("b/my file.ts\t"), "b/my file.ts");
+  assert.equal(diffHeaderPath("b/notes \t"), "b/notes ");
+  const spaced = "diff --git a/notes  b/notes \nindex 1..2 100644\n--- a/notes \t\n+++ b/notes \t\n@@ -1 +1 @@\n-a\n+b\n";
+  assert.deepEqual(unreadChanges(spaced, [{ tool: "read_file", path: "notes ", lines: [1, 1] }]).files, [{ path: "notes ", added: [], removed: [[1, 1]] }]);
+  const tabbed = `diff --git "a/t\\tab.ts" "b/t\\tab.ts"\nindex 1..2 100644\n--- "a/t\\tab.ts"\n+++ "b/t\\tab.ts"\n@@ -1 +1 @@\n-a\n+b\n`;
+  assert.deepEqual([...diffParts(tabbed).lines].map(([path]) => path), ["t\tab.ts"], "a modified file is named by its +++ line, decoded");
+});
+
+test("each finder's answer keeps what it read, and the change's text is read with a tool of its own rather than given in the prompt", async () => {
+  const dir = makeTemp(joinPath(tempRoot(), "rep-find-"));
+  writeTo(joinPath(dir, "diff.patch"), DIFF);
+  const texts = { description: "D-first\nD-second", commitMessages: "M-one" };
+  const given: unknown[] = [];
+  const answers = joinPath(dir, "answers");
+  makeDir(answers);
+  const haiku: Battery = { letter: "B", model: "haiku", effort: null, perCall: 1, contextTokens: 90_000, countdown: true };
+  const toolCall = (id: string, name: string, args: unknown) => ({ id, type: "function" as const, function: { name, arguments: JSON.stringify(args) } });
+  const { chat, requests } = scripted([
+    { role: "assistant", content: null, tool_calls: [toolCall("r1", "read_change_text", { which: "description", start_line: 1, line_count: 400 }), toolCall("r2", "read_diff", { start_line: 7, line_count: 1 })] },
+    submit("submit_findings", { findings: [], unread: [], note: "" }),
+  ]);
+  const outcome = await runFind({
+    chat, batteries: [haiku], tasks: [{ id: "t", slice: { kind: "whole" }, lenses: [] }], change: { ...change, ...texts }, lenses,
+    workspace: (served) => (given.push(served), new Workspace(dir, joinPath(dir, "diff.patch"), "HEAD", served)), placeLines: async () => null,
+    // Far enough off that the finder isn't already being asked to hand in, when it would read nothing.
+    deadline: Date.now() + 3_600_000, maxTurns: 4, log: () => {}, scope: "all", kept: [],
+    // As the shape keeps each answer for a resume.
+    onAnswer: async (answer) => writeTo(joinPath(answers, `${answer.battery}-${answer.call}.json`), JSON.stringify(answer)),
+  });
+  assert.deepEqual(given, [texts], "the workspace serves the texts the brief gives the length of");
+  assert.deepEqual(outcome.answers[0]!.reads, [{ tool: "read_change_text", path: "change-text.md", lines: [1, 2] }, { tool: "read_diff", lines: [7, 7] }]);
+  assert.deepEqual(requests[0]!.tools.map((tool) => tool.function.name), ["read_diff", "read_file", "read_base_file", "list_files", "search", "read_change_text", "submit_findings"]);
+  const selector = requests[0]!.tools.find((tool) => tool.function.name === "read_change_text")!.function.parameters as { required: string[]; properties: { which: { enum: string[] } } };
+  assert.deepEqual([selector.required, selector.properties.which.enum], [["which", "start_line", "line_count"], ["description", "commit-messages"]]);
+  const prompt = String(requests[0]!.messages.find((message) => message.role === "user")?.content);
+  assert.match(prompt, /Its description \(2 lines\) and commit messages \(1 line\) aren't files in the checkout: read them with read_change_text, and cite them as change-text\.md and commit-messages\.txt/);
+  assert.doesNotMatch(prompt, /D-first|M-one/, "the texts themselves aren't in the prompt");
+  const served = requests[1]!.messages.find((message) => message.role === "tool" && message.tool_call_id === "r1");
+  assert.match(String(served?.content), /1: D-first\\n2: D-second/, "the tool returned the description, numbered as it's cited");
+  const resumed = await keptAnswers(dir, () => {});
+  assert.deepEqual(resumed.map((answer) => answer.reads), [outcome.answers[0]!.reads], "a kept answer comes back with its reads");
+  assert.deepEqual(unreadChanges(DIFF, resumed.flatMap((answer) => answer.reads)).unread, 3, "a kept answer's read of the diff counts, and its read of the change's text reads no changed line");
+});
+
+test("each call's answer keeps its own reads, and a call that reads and then fails leaves its reads in no answer", async () => {
+  const dir = makeTemp(joinPath(tempRoot(), "rep-two-"));
+  writeTo(joinPath(dir, "diff.patch"), DIFF);
+  const haiku: Battery = { letter: "B", model: "haiku", effort: null, perCall: 1, contextTokens: 90_000, countdown: true };
+  const read = (start: number): ChatMessage => ({ role: "assistant", content: null, tool_calls: [{ id: `r${start}`, type: "function", function: { name: "read_diff", arguments: JSON.stringify({ start_line: start, line_count: 1 }) } }] });
+  // Each call's conversation has its own script, whichever order the calls run in.
+  const scripts: Record<string, Array<ChatMessage | Error>> = {
+    "all B:a": [read(7), submit("submit_findings", { findings: [], unread: [], note: "" })],
+    // A finder's failed turn ends its run with that error (onFailedTurn "throw"): it isn't asked again.
+    "all B:b": [read(8), new ModelError(500, "the call failed after reading")],
+  };
+  const made: Workspace[] = [];
+  const chat: Chat = async (request) => {
+    const next = scripts[String(request.conversation)]!.shift()!;
+    if (next instanceof Error) throw next;
+    return next;
+  };
+  const outcome = await runFind({
+    chat, batteries: [haiku], tasks: ["a", "b"].map((id) => ({ id, slice: { kind: "whole" as const }, lenses: [] })), change, lenses,
+    workspace: (texts) => { const made_ = new Workspace(dir, joinPath(dir, "diff.patch"), "HEAD", texts); made.push(made_); return made_; }, placeLines: async () => null,
+    deadline: Date.now() + 3_600_000, maxTurns: 4, log: () => {}, scope: "all", kept: [], onAnswer: async () => {},
+  });
+  assert.deepEqual(outcome.answers.map((answer) => [answer.call, answer.reads]), [["a", [{ tool: "read_diff", lines: [7, 7] }]]]);
+  assert.deepEqual(outcome.failed.map((failure) => [failure.call, (failure.error as Error).message]), [["b", "the call failed after reading"]]);
+  assert.deepEqual(made.map((workspace) => workspace.reads).sort((x, y) => x[0]!.lines![0] - y[0]!.lines![0]), [[{ tool: "read_diff", lines: [7, 7] }], [{ tool: "read_diff", lines: [8, 8] }]], "the failed call read line 8 in its own workspace before it failed");
+});
+
+test("a kept answer that holds no reads is asked again, as one that can't be read is", async () => {
+  const dir = makeTemp(joinPath(tempRoot(), "rep-kept-"));
+  makeDir(joinPath(dir, "answers"));
+  const answer = { battery: "B", call: "t", findings: [], unread: [], note: "", bounded: false, dropped: 0 };
+  writeTo(joinPath(dir, "answers", "B-t.json"), JSON.stringify(answer));
+  writeTo(joinPath(dir, "answers", "B-u.json"), JSON.stringify({ ...answer, call: "u", reads: [{ tool: "read_diff", lines: [1, 2] }] }));
+  writeTo(joinPath(dir, "answers", "B-v.json"), "{ not json");
+  writeTo(joinPath(dir, "answers", "B-w.json"), JSON.stringify({ ...answer, call: "w", reads: [] }));
+  const logs: string[] = [];
+  const kept = await keptAnswers(dir, (message) => logs.push(message));
+  assert.deepEqual(kept.map((item) => item.call), ["u", "w"], "an answer whose finder read nothing still says so");
+  assert.ok(logs.some((message) => message.endsWith("B-t.json holds no reads, so its call is asked again")), logs.join("\n"));
+  assert.ok(logs.some((message) => message.endsWith("B-v.json can't be read, so its call is asked again")), logs.join("\n"));
+});
+
+test("the review says which changed lines no reader's read returned, by file, in place of what each reader said it couldn't cover", () => {
+  const files = [
+    { path: "src/a.ts", added: [[42, 42]] as Array<[number, number]>, removed: [[12, 12], [41, 41]] as Array<[number, number]> },
+    { path: "new.ts", basePath: "old.ts", added: [[1, 3]] as Array<[number, number]>, removed: [[1, 1]] as Array<[number, number]> },
+    { path: "package-lock.json", added: [[5, 9]] as Array<[number, number]>, removed: [] },
+  ];
+  const build = (extra: Partial<ShapeReview>) => buildShapeReview({ review: shapeReview([posted("I1", "should-fix")], extra), hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 10 }).body;
+  const some = build({ unreadChanges: { changed: 120, unread: 14, files: [...files, { path: "del.ts", added: [], removed: [[1, 2]] }] }, leftOut: ["package-lock.json"] });
+  assert.match(some, /#### What the review couldn't read\n\n14 of the change's 120 changed lines weren't returned by any read of a reader that answered: `src\/a\.ts`: line 42; removed lines 12, 41 at the base; `new\.ts`: lines 1–3; removed line 1 of `old\.ts` at the base; `package-lock\.json`, which the plan left out of every area: lines 5–9; `del\.ts`: removed lines 1–2 at the base\. A line counts when a read by a reader that answered returned it whole: an added line from the diff or from its file, a removed line from the diff\. A search that matched it doesn't count\./);
+  assert.match(build({ unreadChanges: { changed: 1, unread: 1, files: [{ path: "a.ts", added: [[3, 3]], removed: [] }] } }), /\n\n1 of the change's 1 changed line wasn't returned by any read of a reader that answered: `a\.ts`: line 3\./);
+  assert.doesNotMatch(some, /couldn't cover|No reader read these changed files|Every reader covered/);
+  assert.match(build({ unreadChanges: { changed: 120, unread: 0, files: [] } }), /#### What the review couldn't read\n\nBetween them, the reads of the readers that answered returned every changed line of the change \(120 in all\)\./);
+  assert.match(build({ unreadChanges: { changed: 0, unread: 0, files: [] } }), /#### What the review couldn't read\n\nThe change adds or removes no line of text\./);
+  const many = Array.from({ length: 6_000 }, (_, index) => ({ path: `src/${"d".repeat(60)}/file-${index}.ts`, added: [[1, 2]] as Array<[number, number]>, removed: [] }));
+  const cut = build({ unreadChanges: { changed: 20_000, unread: 12_000, files: many } });
+  assert.ok(cut.length <= BODY_LIMIT);
+  assert.match(cut, /; and \d+ more files\. A line counts when/, "a list too long for GitHub names the rest by their count");
+});
+
+test("the review's unread changes take every area's answers, of both batteries, together", () => {
+  const answer = (battery: string, call: string, reads: ReadRecord[]): FindAnswer => ({ battery, call, findings: [], unread: [], note: "", bounded: false, dropped: 0, reads });
+  const area = (name: string) => ({ name, files: [], tasks: [], questions: [] });
+  const result = (name: string, answers: FindAnswer[]) => ({ area: area(name), answers, failed: [], grouping: { issues: [], problems: [] }, judging: { verdicts: [], unjudged: [] }, all: [] });
+  const plan = { areas: [area("core"), area("tests")], facts: [], note: "" } as unknown as Plan;
+  const review = assembleReview({ label: "re-o.n-1-1", round: 1, roundOf: null, outDir: "", keptDir: null }, "h", "b", { planner: "opus", batteryA: "sol", batteryB: "haiku", judge: "opus" }, [
+    result("core", [answer("A", "x", [{ tool: "read_diff", lines: [7, 7] }]), answer("B", "x", [{ tool: "read_diff", lines: [8, 8] }])]),
+    result("tests", [answer("B", "y", [{ tool: "read_file", path: "test/a.test.ts", lines: [1, 1] }])]),
+  ], plan, [], ["src/a.ts", "test/a.test.ts"], (name, id) => `${name}/${id}`, DIFF);
+  assert.deepEqual(review.unreadChanges, { changed: 4, unread: 1, files: [{ path: "test/a.test.ts", added: [[2, 2]], removed: [] }] });
 });

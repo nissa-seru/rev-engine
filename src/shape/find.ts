@@ -7,13 +7,13 @@
 import { runAgent } from "../agent.ts";
 import type { Chat } from "../llm.ts";
 import { UNTRUSTED } from "../prompts.ts";
-import { safeRelativePath, type ToolDefinition, type Workspace } from "../tools.ts";
+import { changeTextTool, readTools, safeRelativePath, type ChangeTexts, type ReadRecord, type ToolDefinition, type Workspace } from "../tools.ts";
 import { HAND_IN_TURNS, KINDS, SEVERITIES, type Finding, type Kind, type Place, type Severity } from "./types.ts";
 import type { Lens, Task } from "./plan.ts";
 
 export const FIND_SOURCE = { name: "workflow:review-find", blob: "0a5061dd510ab2e16b9f90b649b1255bf63156f8" };
 
-/** The change's own text, which a finding may cite as a place. Finders are given both in their brief. */
+/** The change's own text, which a finding may cite as a place. Finders read both with read_change_text, and their brief gives each one's length. */
 export const TEXT_FILES = ["change-text.md", "commit-messages.txt"];
 
 /** A text's lines as they are numbered: its own, from its first, with blank lines at its end left off. */
@@ -66,6 +66,8 @@ export interface FindAnswer {
   bounded: boolean;
   /** Findings dropped because they were malformed or no place they cite exists, said in the review. */
   dropped: number;
+  /** What the finder read, as its workspace recorded it, which says what the review read of the change. */
+  reads: ReadRecord[];
 }
 
 export const SEVERITY_TEXT = [
@@ -117,6 +119,7 @@ export interface ChangeBrief {
   /** The diff lines (as read_diff numbers them) each changed file's part of the diff spans. */
   diffLines: Map<string, [number, number]>;
   title: string;
+  /** The description and commit messages, which the finders read with read_change_text: the prompt gives their size. */
   description: string;
   commitMessages: string;
   facts: string[];
@@ -189,6 +192,19 @@ export function taskBrief(task: Task, change: ChangeBrief, lenses: Record<string
   return `You are reviewing a code change to answer one question about it. ${reachOf(change).diff}. The question: ${(slice.question ?? "").trim()}\nAnswer it from the code, at the base and at head as it needs. Report each defect the answer shows. If it shows none, return an empty list.`;
 }
 
+/**
+ * Where the change's description and commit messages are, and how many lines each has. They aren't in the prompt, as
+ * the ported find stage leaves them as files a finder reads when it wants them: written into the prompt, they took that
+ * much of every finder's context in every request, before it read any code.
+ */
+export function changeTextsText(change: ChangeBrief): string {
+  const size = (text: string): string => {
+    const lines = numberedLines(text);
+    return `${lines} line${lines === 1 ? "" : "s"}`;
+  };
+  return `Its description (${size(change.description)}) and commit messages (${size(change.commitMessages)}) aren't files in the checkout: read them with read_change_text, and cite them as change-text.md and commit-messages.txt by the line numbers it gives. Commit messages too long to give whole end at [cut here].`;
+}
+
 /** The whole prompt for one call: its task's brief, or its two parts, then what every finder is told. */
 export function callPrompt(call: FindCall, battery: Battery, change: ChangeBrief, lenses: Record<string, Lens>): string {
   const body = call.tasks.length === 1
@@ -204,22 +220,12 @@ export function callPrompt(call: FindCall, battery: Battery, change: ChangeBrief
 
 The pull request's title: ${change.title || "(none)"}
 
-Its description and commit messages are here, not files in the checkout; commit messages too long to give whole end at [cut here]. Cite them as change-text.md and commit-messages.txt, by their numbered lines here.
-
-Its description, cited as change-text.md:
-<description>
-${numbered(change.description)}
-</description>
-
-Its commit messages, cited as commit-messages.txt:
-<commit_messages>
-${numbered(change.commitMessages)}
-</commit_messages>
+${changeTextsText(change)}
 
 ${change.dependencies}${change.roundNote ? `\n${change.roundNote}` : ""}
 
 How to work:
-- Read with the tools: read_diff for the change, read_file for a file at head, read_base_file for a file at the base, list_files and search to find code. They read only this checkout, as it stood at the pull request's head.
+- Read with the tools: read_diff for the change, read_file for a file at head, read_base_file for a file at the base, read_change_text for the description and commit messages, list_files and search to find code. They read only this checkout, as it stood at the pull request's head, and the change's own text.
 ${context}
 
 Report only defects you can point to in the code, each with every place it involves (file and line at head, or at the base for a file the change deletes), its kind, a one-sentence claim with its mechanism, the failing case, and its severity:
@@ -318,8 +324,8 @@ export interface FindOptions {
   tasks: Task[];
   change: ChangeBrief;
   lenses: Record<string, Lens>;
-  /** A workspace for each call, so each finder's reads are kept apart. */
-  workspace: () => Workspace;
+  /** A workspace for each call, so each finder's reads are kept apart, serving the texts it's given with read_change_text. */
+  workspace: (texts: ChangeTexts) => Workspace;
   placeLines: PlaceLines;
   deadline: number;
   maxTurns: number;
@@ -348,10 +354,12 @@ export async function runFind(options: FindOptions): Promise<FindOutcome> {
   await Promise.all(calls.filter(({ battery, call }) => !keptIds.has(`${battery.letter}:${call.id}`)).map(async ({ battery, call }) => {
     const caller = `${options.scope} ${battery.letter}:${call.id}`;
     const report = { bounded: false };
+    // The texts the prompt gives the length of, so what read_change_text serves is what the brief describes.
+    const workspace = options.workspace({ description: options.change.description, commitMessages: options.change.commitMessages });
     try {
       const submission = await runAgent({
         chat: options.chat, model: battery.model, system: `You review a code change, reading it with read-only tools.\n\n${UNTRUSTED}`,
-        prompt: callPrompt(call, battery, options.change, options.lenses), workspace: options.workspace(), submit: foundTool,
+        prompt: callPrompt(call, battery, options.change, options.lenses), workspace, tools: [...readTools, changeTextTool], submit: foundTool,
         deadline: options.deadline, maxTurns: options.maxTurns, handInTurns: HAND_IN_TURNS, log: options.log, caller,
         ...(battery.effort ? { effort: battery.effort } : {}),
         contextBound: battery.contextTokens, report, conversation: caller, onFailedTurn: "throw",
@@ -361,7 +369,7 @@ export async function runFind(options: FindOptions): Promise<FindOutcome> {
       const { findings, dropped } = await checkedFindings(submission.findings, battery.letter, call, options.placeLines);
       const answer: FindAnswer = {
         battery: battery.letter, call: call.id, findings, unread: Array.isArray(submission.unread) ? submission.unread.filter((item): item is string => typeof item === "string" && item.trim() !== "") : [],
-        note: typeof submission.note === "string" ? submission.note.trim() : "", bounded: report.bounded, dropped,
+        note: typeof submission.note === "string" ? submission.note.trim() : "", bounded: report.bounded, dropped, reads: [...workspace.reads],
       };
       answers.push(answer);
       // An answer the run couldn't keep is still this run's answer; only a resume would have to ask it again.

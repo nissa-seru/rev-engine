@@ -35,6 +35,13 @@ export interface PostedIssue {
   why: string;
 }
 
+/** The changed lines no reader's read returned (src/shape/run.ts, UnreadChanges). */
+export interface UnreadChanges {
+  changed: number;
+  unread: number;
+  files: Array<{ path: string; basePath?: string; added: Array<[number, number]>; removed: Array<[number, number]> }>;
+}
+
 export interface ShapeReview {
   label: string;
   head: string;
@@ -46,8 +53,7 @@ export interface ShapeReview {
   notReal: Array<{ area: string; id: string; title: string; notRealKind: string; why: string; places: Place[] }>;
   decided: Array<{ area: string; id: string; title: string; repeatOf: string }>;
   unjudged: Array<{ area: string; id: string; title: string }>;
-  unreadSpots: string[];
-  unread: Array<{ area: string; finder: string; unread: string[] }>;
+  unreadChanges: UnreadChanges;
   empty: string[];
   shortfall: string[];
   bounded: string[];
@@ -89,6 +95,31 @@ const KIND: Record<PostedIssue["kind"], string> = { code: "", test: "test", text
 
 function count(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * What the review read of the change, from what the reads of its readers that answered returned: every changed line, or
+ * those none returned, by file, with a file the plan of several areas left out of every area said as such. `keep` cuts
+ * the list of files. A reader that gave no answer is said apart (the shortfall), and its reads aren't counted.
+ */
+function unreadText(review: ShapeReview, keep: number): string {
+  const { changed, unread, files } = review.unreadChanges;
+  const rule = "A line counts when a read by a reader that answered returned it whole: an added line from the diff or from its file, a removed line from the diff. A search that matched it doesn't count.";
+  if (!changed) return "The change adds or removes no line of text.";
+  if (!unread) return `Between them, the reads of the readers that answered returned every changed line of the change (${changed} in all). ${rule}`;
+  const ranges = (runs: Array<[number, number]>): string => runs.map(([from, to]) => (from === to ? `${from}` : `${from}–${to}`)).join(", ");
+  const size = (runs: Array<[number, number]>): number => runs.reduce((sum, [from, to]) => sum + to - from + 1, 0);
+  const lines = (runs: Array<[number, number]>): string => `${size(runs) === 1 ? "line" : "lines"} ${ranges(runs)}`;
+  const listed = files.slice(0, keep).map((file) => {
+    const parts = [
+      ...(file.added.length ? [lines(file.added)] : []),
+      ...(file.removed.length ? [`removed ${lines(file.removed)} ${file.basePath ? `of \`${file.basePath}\` ` : ""}at the base`] : []),
+    ];
+    const leftOut = review.leftOut.includes(file.path) ? ", which the plan left out of every area" : "";
+    return `\`${file.path}\`${leftOut}: ${parts.join("; ")}`;
+  });
+  const more = files.length > keep ? `; and ${count(files.length - keep, "more file")}` : "";
+  return `${unread} of the change's ${count(changed, "changed line")} ${unread === 1 ? "wasn't" : "weren't"} returned by any read of a reader that answered: ${listed.join("; ")}${more}. ${rule}`;
 }
 
 function title(text: string): string {
@@ -196,7 +227,7 @@ export function shapeRecommendation(review: Pick<ShapeReview, "issues" | "unjudg
   const also: string[] = [];
   if (unsettled) also.push(`${count(unsettled, "more blocker or should-fix issue")} the judge couldn't settle ${unsettled === 1 ? "is" : "are"} listed for a maintainer to weigh.`);
   if (review.unjudged.length) also.push(`${count(review.unjudged.length, "issue")} the judge gave no verdict on ${review.unjudged.length === 1 ? "isn't" : "aren't"} weighed here.`);
-  if (review.shortfall.length) also.push(`${count(review.shortfall.length, "task")} one of the two readers didn't answer ${review.shortfall.length === 1 ? "was" : "were"} read once, not twice.`);
+  if (review.shortfall.length) also.push(`${count(review.shortfall.length, "task")} one of the two readers didn't answer ${review.shortfall.length === 1 ? "was" : "were"} answered once, not twice.`);
   if (review.roundOf) also.push(`It covers only what changed since ${review.base.slice(0, 7)}, the commit an earlier review read; that review's issues stand as it gave them.`);
   const tail = also.length ? ` ${also.join(" ")}` : "";
   if (blockers) return `**Recommendation: fix, then merge.** ${count(blockers, "blocker")} should be fixed first.${tail}`;
@@ -284,18 +315,14 @@ function summary(input: ShapeInput, built: Built, links: Array<string | undefine
     sections.push(inView || severity === "blocker" ? `${heading}\n\n${list}` : `${heading}\n\n<details>\n<summary>${count(issues.length, severity === "minor" ? "minor issue" : "issue")}</summary>\n\n${list}\n\n</details>`);
   }
 
-  const unread: string[] = [];
-  if (review.unreadSpots.length) unread.push(`Two or more readers said they couldn't cover these changed files, and no issue cites them: ${review.unreadSpots.slice(0, keep).map((file) => `\`${file}\``).join(", ")}${review.unreadSpots.length > keep ? `, and ${review.unreadSpots.length - keep} more` : ""}.`);
-  if (review.shortfall.length) unread.push(`**${review.models.batteryB} gave no answer for ${count(review.shortfall.length, "task")}: ${review.shortfall.join(", ")}.** Those tasks were read by ${review.models.batteryA} alone.`);
+  const unread: string[] = [unreadText(review, keep)];
+  if (review.shortfall.length) unread.push(`**${review.models.batteryB} gave no answer for ${count(review.shortfall.length, "task")}: ${review.shortfall.join(", ")}.** Those tasks were answered by ${review.models.batteryA} alone.`);
   if (review.bounded.length) unread.push(`${count(review.bounded.length, "reader")} reached the size of conversation it can hold and handed in what it had: ${review.bounded.join(", ")}.`);
-  if (review.leftOut.length) unread.push(`No reader read these changed files, which the plan left out as generated, vendored or lockfiles: ${review.leftOut.slice(0, keep).map((file) => `\`${file}\``).join(", ")}${review.leftOut.length > keep ? `, and ${review.leftOut.length - keep} more` : ""}.`);
   if (review.dropped) unread.push(`${count(review.dropped, "finding")} ${review.dropped === 1 ? "was" : "were"} left out because ${review.dropped === 1 ? "it was" : "they were"} malformed or cited no file at the reviewed commit or its base.`);
   if (review.withoutDependencies) unread.push("The readers had no installed dependencies (none to install, or none installed or placed), so a dependency's behaviour was known only from the repository's own text.");
   if (review.dependenciesFromRanges) unread.push("The head has no lockfile at its root, so its dependencies were installed from package.json's version ranges, and a dependency the readers read may be a later version than the author ran.");
   if (review.planNote) unread.push(`The plan's note: ${short(review.planNote.replace(/\s*\n+\s*/g, " "))}`);
-  const parts = review.unread.map((item) => `- ${item.finder}: ${short(item.unread.join("; ").replace(/\s*\n+\s*/g, " "))}`);
-  if (parts.length) unread.push(`<details>\n<summary>What each reader said it couldn't cover (${parts.length})</summary>\n\n${parts.slice(0, keep).join("\n")}${parts.length > keep ? `\n- and ${parts.length - keep} more` : ""}\n\n</details>`);
-  sections.push(`#### What the review couldn't read\n\n${unread.length ? unread.join("\n\n") : "Every reader covered its part."}`);
+  sections.push(`#### What the review couldn't read\n\n${unread.join("\n\n")}`);
 
   const more: string[] = [];
   // The issues the judge held not real aren't shown: they stay in the run's record (shape-review.json, judged.jsonl).
@@ -320,8 +347,7 @@ export function buildShapeReview(given: ShapeInput, links: Array<string | undefi
   const input = { ...given, review: inertReview(given.review) };
   const built = chooseComments(input);
   const total = Math.max(
-    input.review.issues.length, input.review.unread.length, input.review.unreadSpots.length, input.review.problems.length,
-    input.review.leftOut.length, input.review.unjudged.length, 1,
+    input.review.issues.length, input.review.unreadChanges.files.length, input.review.problems.length, input.review.unjudged.length, 1,
   );
   const limit = BODY_LIMIT - tail(input.review).length;
   const tries: Array<{ compact: Set<Severity>; keep: number }> = [
