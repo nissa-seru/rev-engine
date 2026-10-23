@@ -231,6 +231,8 @@ runs:
         for nwo in $CONSUMERS; do
           [[ "$nwo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$nwo" != */.* && "$nwo" != .* ]] || { echo "::warning::consumers: \"$nwo\" is not owner/name, so it isn't read"; continue; }
           dest="$dir/${nwo%%/*}__${nwo#*/}"
+          # A consumer named twice is read once; its first clone is never touched by the second's failure.
+          if [ -e "$dest" ]; then echo "::notice::consumers: $nwo is named more than once, and is read once"; continue; fi
           # Nothing a failed clone leaves behind is read as the consumer.
           git clone --quiet --depth 1 "https://github.com/$nwo.git" "$dest" || { rm -rf "$dest"; echo "::warning::consumers: $nwo couldn't be cloned (a misspelt name, or a repository this job can't read), so the review reads without it"; }
         done

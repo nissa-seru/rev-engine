@@ -8,6 +8,16 @@ export const SEVERITY_RANK: Record<Severity, number> = { blocker: 0, "should-fix
 /** Requests a stage's model may take once it is asked to hand in, reading nothing more (runAgent's handInTurns). */
 export const HAND_IN_TURNS = 3;
 
+/**
+ * Causes or consequences as one sentence, as every place that shows an issue writes them: each part without its own
+ * closing punctuation, joined with "; ", ending in one full stop, or in the last part's own question or exclamation
+ * mark. The posting side (action/shape.ts, which runs in the same image) and the findings file share it.
+ */
+export function clause(parts: string[]): string {
+  const joined = parts.map((part) => part.trim().replace(/[\s.,;:]+$/, "")).filter(Boolean).join("; ");
+  return /[?!]$/.test(joined) ? joined : `${joined}.`;
+}
+
 export type Kind = "code" | "test" | "text";
 export const KINDS: readonly Kind[] = ["code", "test", "text"];
 

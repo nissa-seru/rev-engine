@@ -146,12 +146,14 @@ jobs:
           docker run --rm -v "$PWD:/work" -w /work --user "$(id -u):$(id -g)" -e HOME=/tmp "$image" "${install[@]}"
           # A package.json that names no dependencies can leave no node_modules at all.
           if [ ! -d node_modules ]; then echo "::notice::The install left no node_modules, so there are no dependencies to pass on"; exit 0; fi
-          if [ -n "$ranges" ]; then touch node_modules/.installed-from-ranges; fi
           # A lockfile can make node_modules/<x> a link to a path of its choosing, even with scripts off, and the
           # upload follows links: one into /proc/self would carry the uploading step's own environment, its runtime
           # token among it, into the artifact. So no link leaves this job; the readers skip links anyway.
           find node_modules -type l -delete
           if [ -n "$(find node_modules -type l -print -quit)" ]; then echo "::error::links remain in node_modules"; exit 1; fi
+          # An upload of no files makes no artifact, and the review would name one that isn't there.
+          if [ -z "$(find node_modules -type f -print -quit)" ]; then echo "::notice::The install left no files in node_modules, so there are no dependencies to pass on"; exit 0; fi
+          if [ -n "$ranges" ]; then touch node_modules/.installed-from-ranges; fi
           echo "installed=true" >> "$GITHUB_OUTPUT"
       - name: Pass them on
         id: pass
@@ -162,6 +164,8 @@ jobs:
           path: node_modules
           include-hidden-files: true
           retention-days: 1
+          # A re-run of the workflow uploads again under the same name, which upload-artifact refuses unless told.
+          overwrite: true
 
   review:
     needs: [who, dependencies]

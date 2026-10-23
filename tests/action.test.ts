@@ -148,14 +148,14 @@ test("the stop comment says what was kept, and why not when GitHub's cache was t
 });
 
 test("the dependencies job installs each lockfile with its own installer, and only a root with none from package.json's ranges", () => {
-  const install = (files: string[], leaves = true) => runStep("Install the dependencies, scripts off, in a container", {}, (temp) => {
+  const install = (files: string[], leaves: "files" | "nothing" | "links" = "files") => runStep("Install the dependencies, scripts off, in a container", {}, (temp) => {
     mkdirSync(join(temp, "head"));
     for (const file of files) writeFileSync(join(temp, "head", file), "{}");
     // What the head itself commits at node_modules, a ranges marker among it, is never passed on.
     mkdirSync(join(temp, "head/node_modules/committed"), { recursive: true });
     writeFileSync(join(temp, "head/node_modules/.installed-from-ranges"), "");
     // docker as the install leaves it: node_modules with a package, and a link a lockfile could ask for.
-    stub(temp, "docker", `printf '%s\\n' "$@" > "${join(temp, "docker-args")}"\n${leaves ? `mkdir -p node_modules/pkg && echo x > node_modules/pkg/index.js && ln -s /proc/self/environ node_modules/env` : ""}`);
+    stub(temp, "docker", `printf '%s\\n' "$@" > "${join(temp, "docker-args")}"\n${{ files: `mkdir -p node_modules/pkg && echo x > node_modules/pkg/index.js && ln -s /proc/self/environ node_modules/env`, links: `mkdir -p node_modules && ln -s /proc/self/environ node_modules/env`, nothing: "" }[leaves]}`);
   }, { source: WORKFLOW, cwd: "head" });
   const asked = (temp: string) => existsSync(join(temp, "docker-args")) ? readFileSync(join(temp, "docker-args"), "utf8").split("\n").filter(Boolean) : [];
   const cases: Array<[string[], string | null, string[]]> = [
@@ -189,19 +189,24 @@ test("the dependencies job installs each lockfile with its own installer, and on
     assert.equal(existsSync(join(temp, "head/node_modules/.installed-from-ranges")), files.length === 1, `${files.join(" ")}: the ranges marker only where there's no lockfile`);
     assert.ok(!existsSync(join(temp, "head/node_modules/env")) && existsSync(join(temp, "head/node_modules/pkg/index.js")), `${files.join(" ")}: links go, packages stay`);
   }
-  const empty = install(["package.json"], false);
+  const empty = install(["package.json"], "nothing");
   assert.deepEqual(empty.outputs, {}, "an install that leaves no node_modules passes nothing on, and doesn't fail");
   assert.match(empty.stdout, /::notice::The install left no node_modules/);
+  const onlyLinks = install(["package.json", "package-lock.json"], "links");
+  assert.deepEqual(onlyLinks.outputs, {}, "an install that leaves nothing but links passes nothing on, since an upload of no files makes no artifact");
+  assert.match(onlyLinks.stdout, /::notice::The install left no files in node_modules/);
 });
 
 test("a consumer that can't be cloned, or isn't owner/name, is said and the rest are still read", () => {
-  const { stdout, temp } = runStep("Check out the consumers", { CONSUMERS: "o/gone ../x o/kept" }, (temp) => {
+  const { stdout, temp } = runStep("Check out the consumers", { CONSUMERS: "o/gone ../x o/kept o/kept" }, (temp) => {
     mkdirSync(join(temp, "rev-engine-prime-checkout"));
     // A clone that fails partway leaves what it wrote.
     stub(temp, "git", `for last; do :; done\nmkdir -p "$last"\ncase "$*" in *o/gone.git*) touch "$last/partial"; exit 128 ;; esac`);
   });
   assert.deepEqual(readdirSync(join(temp, "rev-engine-prime-checkout/.consumers")), ["o__kept"], "nothing of a failed clone is left to read");
-  assert.match(stdout, /::warning::consumers: o\/gone couldn't be cloned/);
+  assert.deepEqual(readdirSync(join(temp, "rev-engine-prime-checkout/.consumers/o__kept")), [], "a consumer named twice keeps its first clone");
+  assert.match(stdout, /::notice::consumers: o\/kept is named more than once, and is read once/);
+  assert.match(stdout, /::warning::consumers: o\/gone couldn't be cloned \(a misspelt name, or a repository this job can't read\), so the review reads without it/);
   assert.match(stdout, /::warning::consumers: "\.\.\/x" is not owner\/name/);
 });
 

@@ -19,7 +19,7 @@ import { groupFindings } from "./group.ts";
 import { judgeIssues, type JudgeVerdict } from "./judge.ts";
 import { writePlan, type Area, type Lens, type Plan, type Task } from "./plan.ts";
 import { settleSeverities } from "./severity.ts";
-import { SEVERITY_RANK, type Finding, type Issue, type Kind, type Place, type Severity } from "./types.ts";
+import { clause, SEVERITY_RANK, type Finding, type Issue, type Kind, type Place, type Severity } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -334,6 +334,8 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   // Project rules as the pull request's base has them, which in a later round isn't the base the review reads from.
   const rulesBase = config.shape?.rulesBase ?? config.base;
   const rulesWorkspace = rulesBase === config.base ? main : new Workspace(config.repoDir, config.diffPath, rulesBase);
+  // Each lens's title and Look-for text, ported by hand from its source (`name`, `blob`) and worded for any project's
+  // review; a later change at the source is ported by hand, as the briefs are.
   const lenses = JSON.parse(await readFile(new URL("./lenses.json", import.meta.url), "utf8")) as Record<string, Lens>;
   const [pr, diff, rules, prior, messages] = await Promise.all([loadPullRequest(config), main.diff(), loadRules(rulesWorkspace), loadPrior(config.priorJsonPath, log), commitMessages(config, log)]);
   // The change's own text is cited by its lines as the finders are given it.
@@ -512,13 +514,15 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
 
   // The severity check, once over every issue the judge kept in every area.
   const key = (area: string, id: string): string => (plan.areas.length > 1 ? `${area}/${id}` : id);
-  const kept = judged.flatMap(({ area, grouping, judging }) => judging.verdicts
+  const kept = judged.flatMap(({ area, grouping, judging, all }) => judging.verdicts
     .filter((verdict) => verdict.verdict === "real" || verdict.verdict === "unsure")
-    .map((verdict) => ({ area: area.name, verdict, issue: grouping.issues.find((issue) => issue.id === verdict.issue)! })));
+    .map((verdict) => ({ area: area.name, verdict, all, issue: grouping.issues.find((issue) => issue.id === verdict.issue)! })));
   const settled = await settleSeverities(
-    kept.map(({ area, verdict, issue }) => ({
+    kept.map(({ area, verdict, issue, all }) => ({
       id: key(area, issue.id), title: issue.title, causes: issue.causes, consequences: issue.consequences, severity: verdict.judgedSeverity,
       verdict: verdict.verdict === "unsure" ? "unsure" as const : "real" as const, why: verdict.why,
+      // An issue of one left-out finding has no consequences of its own; its finding's case is what says what's at stake.
+      ...(issue.consequences.length ? {} : { failingCase: all.find((finding) => finding.key === issue.findings[0])?.failingCase ?? "" }),
     })),
     { chat: claude, model: opus, effort: EFFORT.opus, workspace: main, deadline, log },
   );
@@ -630,8 +634,8 @@ export function toFinding(issue: PostedIssue, producer: string): OutputFinding |
   const spot = shownPlace(issue);
   if (!spot) return null;
   const parts = [issue.title.replace(/[.:]+$/, "") + "."];
-  if (issue.causes.length) parts.push(`Cause: ${issue.causes.join("; ")}.`);
-  if (issue.consequences.length) parts.push(`Consequence: ${issue.consequences.join("; ")}.`);
+  if (issue.causes.length) parts.push(`Cause: ${clause(issue.causes)}`);
+  if (issue.consequences.length) parts.push(`Consequence: ${clause(issue.consequences)}`);
   if (issue.failingCase) parts.push(`Case: ${issue.failingCase}`);
   return { file: spot.file, start_line: spot.line, end_line: spot.line, message: parts.join(" ").slice(0, 2_500), producer };
 }

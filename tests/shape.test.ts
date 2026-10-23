@@ -12,7 +12,7 @@ import { mkdirSync as makeDir, mkdtempSync as makeTemp, writeFileSync as writeTo
 import { tmpdir as tempRoot } from "node:os";
 import { join as joinPath } from "node:path";
 import { settleSeverities, severityPrompt } from "../src/shape/severity.ts";
-import type { Finding, Issue } from "../src/shape/types.ts";
+import { clause, type Finding, type Issue } from "../src/shape/types.ts";
 import { buildShapeReview, BODY_LIMIT, cut, markedIssue, shapeCommentBody, type ShapeReview } from "../action/shape.ts";
 import { parseHunks, quietMentions, quietParts } from "../action/comments.ts";
 
@@ -132,6 +132,7 @@ test("a small grouper that gives no grouping is asked of the large one, and a fi
   assert.equal(grouping.model, "large");
   assert.deepEqual(grouping.issues.map((issue) => issue.findings), [["A:t[0]"], ["B:t[0]"]]);
   assert.ok(grouping.problems.some((problem) => problem.includes("became an issue of its own: B:t[0]")));
+  assert.deepEqual([grouping.issues[1]!.causes, grouping.issues[1]!.consequences], [[], []], "a finding on its own states no cause or consequence beyond its claim and case");
   assert.deepEqual(requests[0]!.tools.map((tool) => tool.function.name), ["submit_issues"], "the grouper reads nothing");
 });
 
@@ -630,7 +631,7 @@ test("a cited path is kept as the file tools spell it, and one outside the check
 
 test("a review whose readers had no installed dependencies says so where it says what it couldn't read", () => {
   const without = buildShapeReview({ review: { ...shapeReview([posted("I1", "should-fix")]), withoutDependencies: true }, hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 10 });
-  assert.match(without.body, /The readers had no installed dependencies \(none to install, or none installed\), so a dependency's behaviour was known only from the repository's own text\.\n/);
+  assert.match(without.body, /The readers had no installed dependencies \(none to install, or none installed or placed\), so a dependency's behaviour was known only from the repository's own text\.\n/);
   assert.doesNotMatch(without.body, /Every reader covered its part/);
   const with_ = buildShapeReview({ review: shapeReview([posted("I1", "should-fix")]), hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 10 });
   assert.doesNotMatch(with_.body, /no installed dependencies/);
@@ -650,6 +651,37 @@ test("the readers are told where the dependencies came from by the marker the de
   const ranged = await surroundings(repo);
   assert.deepEqual([ranged.installed, ranged.fromRanges], [true, true]);
   assert.match(ranged.text, /from its package\.json's version ranges, since it has no lockfile at its root/);
+});
+
+test("an issue's cause and consequence end with one full stop, and an issue of one finding repeats nothing", () => {
+  const stopped = shapeCommentBody({ ...posted("I1", "blocker"), causes: ["a cause."], consequences: ["one.", "two;", "three. "] }, shapeReview([]));
+  assert.match(stopped, /Cause: a cause\.\n\nConsequence: one; two; three\.\n\nCase: the case/);
+  assert.doesNotMatch(stopped, /\.\.|\.;|;;/);
+  assert.equal(clause(["why it fails?"]), "why it fails?", "a question keeps its own mark");
+  assert.equal(clause(["a,", "b:"]), "a; b.");
+  const alone = shapeCommentBody({ ...posted("I2", "should-fix"), title: "The claim.", causes: [], consequences: [], failingCase: "The case." }, shapeReview([]));
+  assert.doesNotMatch(alone, /Cause:|Consequence:/);
+  assert.equal(alone.split("The claim").length - 1, 1, "the claim is said once, as the title");
+  assert.match(alone, /Case: The case\./);
+  assert.deepEqual(toFinding({ ...posted("I3", "minor"), causes: ["c."], consequences: [] }, "p")?.message, "Issue I3. Cause: c. Case: the case");
+  assert.deepEqual(toFinding({ ...posted("I3", "minor"), causes: ["c1.", "c2"], consequences: ["d1;", "d2."] }, "p")?.message, "Issue I3. Cause: c1; c2. Consequence: d1; d2. Case: the case");
+  const alonePrompt = severityPrompt([{ id: "I4", title: "t", verdict: "real", severity: "minor", causes: [], consequences: [], why: "w", failingCase: "the input that shows it" }]);
+  assert.doesNotMatch(alonePrompt, /Causes:|Consequences:/);
+  assert.match(alonePrompt, /Its case: the input that shows it/, "an issue of one finding keeps its case for the severity check");
+  const grouped = severityPrompt([{ id: "I5", title: "t", verdict: "real", severity: "minor", causes: ["c1", "c2"], consequences: ["d"], why: "w", failingCase: "unused" }]);
+  assert.match(grouped, /Causes: c1; c2\nConsequences: d\n/);
+  assert.doesNotMatch(grouped, /Its case/, "an issue with consequences is graded on them, as before");
+});
+
+test("the shipped lenses each have their text and source, and speak to any project", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const shipped = JSON.parse(await readFile(new URL("../src/shape/lenses.json", import.meta.url), "utf8")) as Record<string, Lens>;
+  assert.ok(Object.keys(shipped).length >= 10);
+  for (const [id, lens] of Object.entries(shipped)) {
+    assert.ok(lens.title && lens.lookFor && lens.name && /^[0-9a-f]{40}$/.test(lens.blob), id);
+    // A public reviewer reads others' code: its lenses don't speak of a household of their own, or of someone's consent.
+    assert.doesNotMatch(`${lens.title}\n${lens.lookFor}`, /\bhouse('s)?\b|\bher consent\b/i, id);
+  }
 });
 
 test("a comment too long for GitHub is cut, naming the artifact that holds it whole as code", () => {

@@ -232,7 +232,8 @@ export async function groupFindings(findings: Finding[], options: GroupOptions):
   const kept = new Set<string>();
   const untitled = asked.filter((issue) => issue.members.filter((member) => known.has(member) && !kept.has(member) && kept.add(member)).length && !issue.title).length;
   if (untitled) found.problems.push(`${untitled} issue(s) the grouper gave no title are titled by the claim of their first finding`);
-  const issues = [...asked, ...alone.map((finding) => ({ title: finding.claim, causes: [finding.claim], consequences: [finding.failingCase], members: [finding.key] }))];
+  // Its finding's claim is its title and its case is its case, so it has no cause or consequence of its own to state.
+  const issues = [...asked, ...alone.map((finding) => ({ title: finding.claim, causes: [], consequences: [], members: [finding.key] }))];
   return { issues: numberIssues(issues, findings), problems: found.problems, model };
 }
 

@@ -3,6 +3,7 @@
 // limit allows, and says what the review couldn't read. This folder is mounted on its own, so the result's shape is
 // declared here again.
 import { earlierComment, MARKER, place, type ExistingComment, type Finding, type Hunks, type LineComment, type ReviewParts, type Severity as Level } from "./comments.ts";
+import { clause } from "../src/shape/types.ts";
 
 export type Severity = "blocker" | "should-fix" | "minor";
 
@@ -136,8 +137,8 @@ function rating(issue: PostedIssue): string {
 /** An issue's whole text: its causes, consequences and case, who found it, and whether the judge settled it. */
 function detail(issue: PostedIssue, review: ShapeReview): string {
   const parts: string[] = [];
-  if (issue.causes.length) parts.push(`Cause: ${issue.causes.join("; ")}.`);
-  if (issue.consequences.length) parts.push(`Consequence: ${issue.consequences.join("; ")}.`);
+  if (issue.causes.length) parts.push(`Cause: ${clause(issue.causes)}`);
+  if (issue.consequences.length) parts.push(`Consequence: ${clause(issue.consequences)}`);
   if (issue.failingCase) parts.push(`Case: ${issue.failingCase}`);
   parts.push(foundBy(issue, review));
   if (issue.verdict === "unsure") parts.push("The judge couldn't settle it from the code, so it is listed for a maintainer to weigh.");
@@ -289,7 +290,7 @@ function summary(input: ShapeInput, built: Built, links: Array<string | undefine
   if (review.bounded.length) unread.push(`${count(review.bounded.length, "reader")} reached the size of conversation it can hold and handed in what it had: ${review.bounded.join(", ")}.`);
   if (review.leftOut.length) unread.push(`No reader read these changed files, which the plan left out as generated, vendored or lockfiles: ${review.leftOut.slice(0, keep).map((file) => `\`${file}\``).join(", ")}${review.leftOut.length > keep ? `, and ${review.leftOut.length - keep} more` : ""}.`);
   if (review.dropped) unread.push(`${count(review.dropped, "finding")} ${review.dropped === 1 ? "was" : "were"} left out because ${review.dropped === 1 ? "it was" : "they were"} malformed or cited no file at the reviewed commit or its base.`);
-  if (review.withoutDependencies) unread.push("The readers had no installed dependencies (none to install, or none installed), so a dependency's behaviour was known only from the repository's own text.");
+  if (review.withoutDependencies) unread.push("The readers had no installed dependencies (none to install, or none installed or placed), so a dependency's behaviour was known only from the repository's own text.");
   if (review.dependenciesFromRanges) unread.push("The head has no lockfile at its root, so its dependencies were installed from package.json's version ranges, and a dependency the readers read may be a later version than the author ran.");
   if (review.planNote) unread.push(`The plan's note: ${short(review.planNote.replace(/\s*\n+\s*/g, " "))}`);
   const parts = review.unread.map((item) => `- ${item.finder}: ${short(item.unread.join("; ").replace(/\s*\n+\s*/g, " "))}`);

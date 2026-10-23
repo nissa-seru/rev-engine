@@ -18,6 +18,8 @@ export interface Graded {
   /** real, or unsure when the judge couldn't settle it from the code. */
   verdict: "real" | "unsure";
   why: string;
+  /** Its finding's case, for an issue with no consequences of its own (one left-out finding). */
+  failingCase?: string;
 }
 
 const severitiesTool: ToolDefinition = {
@@ -57,7 +59,7 @@ Keep the judge's grade where it fits these definitions beside the others. Change
 
 Hand in a severity for every issue, by its id, by calling submit_severities.
 
-${issues.map((issue) => `### ${issue.id}: ${issue.title}\nThe judge's verdict: ${issue.verdict}. Its grade: ${issue.severity}.\nCauses: ${issue.causes.join("; ")}\nConsequences: ${issue.consequences.join("; ")}\nThe judge's reason: ${issue.why}`).join("\n\n")}`;
+${issues.map((issue) => [`### ${issue.id}: ${issue.title}`, `The judge's verdict: ${issue.verdict}. Its grade: ${issue.severity}.`, ...(issue.causes.length ? [`Causes: ${issue.causes.join("; ")}`] : []), ...(issue.consequences.length ? [`Consequences: ${issue.consequences.join("; ")}`] : issue.failingCase ? [`Its case: ${issue.failingCase}`] : []), `The judge's reason: ${issue.why}`].join("\n")).join("\n\n")}`;
 }
 
 export interface SeverityOptions {
