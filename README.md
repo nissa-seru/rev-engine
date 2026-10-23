@@ -32,7 +32,7 @@ With Claude Opus 5.5, a typical review takes about 3 minutes and costs about $1 
 
 - The model only reads the pull request's code. It never runs the code, and the pull request's text is treated as untrusted input.
 - The project's rules, such as `AGENTS.md` and `CONTRIBUTING.md`, are read from the base branch, so a pull request cannot rewrite the rules it is reviewed against.
-- Only people with write access can start a review by comment, and pull requests from forks are skipped unless you allow them. A workflow can also review pull requests as they open, choosing itself whose (the `authors` input).
+- Only people with write access can start a review by comment, and pull requests from forks are skipped unless you allow them. A workflow can also review pull requests as they open and decide itself which ones, with the `authors` input set to `any`.
 
 ## Docs
 

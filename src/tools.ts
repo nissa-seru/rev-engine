@@ -10,7 +10,10 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-const MAX_FILE_BYTES = 1_000_000;
+// What one file may cost to load. Reads are bounded per call (MAX_READ_LINES, MAX_READ_BYTES) and per reader
+// (MAX_TOTAL_OUTPUT_BYTES), so this needn't keep a large source file from being read a piece at a time.
+const MAX_FILE_BYTES = 16_000_000;
+const MAX_SKIPPED_NAMED = 20;
 const MAX_READ_BYTES = 48_000;
 const MAX_READ_LINES = 400;
 const MAX_LIST_FILES = 2_000;
@@ -161,7 +164,10 @@ export class Workspace {
     }
   }
 
-  /** The text of a file at the base revision, or null when it did not exist there. */
+  /**
+   * The text of a file at the base revision, or null when it did not exist there or can't be read (binary, or a blob
+   * this clone doesn't hold). Throws for one too large to load.
+   */
   async baseFile(path: string): Promise<string | null> {
     const safe = safeRelativePath(path);
     try {
@@ -171,7 +177,9 @@ export class Workspace {
         { maxBuffer: MAX_FILE_BYTES, env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" } },
       );
       return stdout.includes("\0") ? null : stdout;
-    } catch {
+    } catch (error) {
+      // Too large to load is not missing, and a reader told it was would look for it elsewhere.
+      if ((error as NodeJS.ErrnoException)?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") throw new Error("file is too large to read");
       return null;
     }
   }
@@ -214,22 +222,33 @@ export class Workspace {
     this.reads.push(lines ? { ...entry, lines } : entry);
   }
 
-  private async search(query: unknown, path: unknown, ignoreCase: unknown): Promise<{ ok: true; results: Array<{ path: string; line: number; text: string }>; truncated: boolean }> {
+  private async search(query: unknown, path: unknown, ignoreCase: unknown): Promise<{ ok: true; results: Array<{ path: string; line: number; text: string }>; truncated: boolean; tooLarge?: string[]; tooLargeMore?: number }> {
     if (typeof query !== "string" || !query || query.length > 500) throw new Error("query is invalid");
     const root = await this.canonicalRoot();
     const needle = ignoreCase ? query.toLowerCase() : query;
     const results: Array<{ path: string; line: number; text: string }> = [];
+    // A file too large to search is named, so a reader knows it wasn't searched rather than that it holds nothing; past
+    // the first few names, the rest are counted. A search that stops at its hit limit names those it reached.
+    const tooLarge: string[] = [];
+    const answer = (truncated: boolean) => ({
+      ok: true as const, results, truncated,
+      ...(tooLarge.length ? { tooLarge: tooLarge.slice(0, MAX_SKIPPED_NAMED) } : {}),
+      ...(tooLarge.length > MAX_SKIPPED_NAMED ? { tooLargeMore: tooLarge.length - MAX_SKIPPED_NAMED } : {}),
+    });
     for (const file of await this.walk(await this.contained(path ?? ""), MAX_SEARCH_FILES)) {
-      const text = await this.textFile(join(root, file)).catch(() => null);
+      const text = await this.textFile(join(root, file)).catch((error: unknown) => {
+        if (error instanceof Error && error.message === "file is too large to read") tooLarge.push(file);
+        return null;
+      });
       if (text === null) continue;
       if (!(ignoreCase ? text.toLowerCase() : text).includes(needle)) continue;
       for (const [index, line] of text.split("\n").entries()) {
         if (!(ignoreCase ? line.toLowerCase() : line).includes(needle)) continue;
         results.push({ path: file, line: index + 1, text: line.trim().slice(0, 300) });
-        if (results.length >= MAX_SEARCH_RESULTS) return { ok: true, results, truncated: true };
+        if (results.length >= MAX_SEARCH_RESULTS) return answer(true);
       }
     }
-    return { ok: true, results, truncated: false };
+    return answer(false);
   }
 
   private async dispatch(name: string, args: Record<string, unknown>): Promise<unknown> {

@@ -30,17 +30,32 @@ inputs:
     description: The least severe findings that get a comment. One of high, medium or low. Less severe findings are listed in a collapsed section of the summary.
     default: medium
   max-findings:
-    description: Cap on the number of findings that get a comment. Findings past the cap join the collapsed section.
+    description: Cap on the number of findings that get a comment. Findings past the cap join the collapsed section; the shape lists every issue under its severity in the summary, as far as GitHub's size limit allows, counting what it leaves out, and as a last resort cuts the summary's tail, saying so.
     default: "10"
   fit:
     description: Set to "on" to also say whether the change belongs in the project, judged by the goals and design the project states.
     default: "on"
   time-budget:
-    description: Seconds allowed for the review.
+    description: Seconds allowed for the review. The shape doesn't use it.
     default: "780"
   allow-forks:
     description: Set to "true" to review pull requests from forks. Their code is only read, never run.
     default: "false"
+  pipeline:
+    description: Which review runs. "reader" is RevEngine's own reviewer. "shape" is the review shape in src/shape - a planner, a Sol battery and a haiku battery over every task of its plan, a grouper, a judge and a severity check - which takes as long as it needs, up to the job's limit, and needs sol-base-url.
+    default: reader
+  sol-base-url:
+    description: For the shape, where Sol is asked, an OpenAI Responses endpoint, as RB_SOL_BASE_URL in docs/SETTINGS.md. It is reached with model-api-key.
+    default: ""
+  dependencies:
+    description: For the shape, the name of an artifact of this workflow run that holds the head's installed dependencies, the contents of a node_modules directory, placed in the checkout's node_modules for the readers to read. Empty for none.
+    default: ""
+  dependencies-head:
+    description: For the shape, the head commit the dependencies were installed from. They are placed only when the review reads that same head, so a push between the install and the review can't pair one revision with another's dependencies.
+    default: ""
+  consumers:
+    description: For the shape, public repositories that rely on this one, as owner/name separated by spaces. Each is checked out at its default branch under .consumers/<owner>__<name> in the checkout, for the readers to read their use.
+    default: ""
   authors:
     description: Which pull request events start a review. "writers" (the default) needs the person whose action raised the event, such as opening or reopening the pull request, to be able to push to the repository. "any" reviews whoever raised it, for a workflow that decides itself which pull requests to review, such as one started by pull_request_target. A comment or a manual run always needs a person with write access.
     default: writers
@@ -65,6 +80,7 @@ runs:
         COMMAND: ${{ inputs.command }}
         ALLOW_FORKS: ${{ inputs.allow-forks }}
         AUTHORS: ${{ inputs.authors }}
+        PIPELINE: ${{ inputs.pipeline }}
       run: |
         set -euo pipefail
         skip() { echo "::notice::No review: $1"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; }
@@ -94,12 +110,20 @@ runs:
         if [ "$(jq -r '.head.repo.full_name // ""' "$RUNNER_TEMP/rev-engine-prime/pull.json")" != "$REPO" ] && [ "$ALLOW_FORKS" != true ]; then
           skip "pull request $number comes from a fork and allow-forks is not set"
         fi
-        {
-          echo "run=true"
-          echo "number=$number"
-          echo "base=$(jq -r .base.sha "$RUNNER_TEMP/rev-engine-prime/pull.json")"
-          echo "head=$(jq -r .head.sha "$RUNNER_TEMP/rev-engine-prime/pull.json")"
-        } >> "$GITHUB_OUTPUT"
+        base=$(jq -r .base.sha "$RUNNER_TEMP/rev-engine-prime/pull.json")
+        head=$(jq -r .head.sha "$RUNNER_TEMP/rev-engine-prime/pull.json")
+        [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::pull request $number has no base or head commit in its answer"; exit 1; }
+        # A dispatched run of the shape (by hand, or a scheduled resume that dispatches) goes on with a stopped review;
+        # at a head whose review is done it would be a fresh full review instead, which a /review comment asks for. A
+        # summary's own marker, the whole of its last line but one, names its head.
+        if [ "$PIPELINE" = shape ] && [ "$EVENT_NAME" = workflow_dispatch ]; then
+          # Read whole first, so a failed lookup fails the run and grep's early exit can't fail the pipe.
+          summaries=$(gh api --paginate "repos/$REPO/pulls/$number/reviews" --jq '.[] | select(.user.login == "github-actions[bot]") | [.body | split("\n")[] | select(length > 0)] | .[-2] // ""')
+          if grep -qxE "<!-- rev-engine-shape-review [A-Za-z0-9._-]+-[0-9]+ $head -->" <<<"$summaries"; then
+            skip "a review of $head is done; comment $COMMAND on the pull request to review it again"
+          fi
+        fi
+        { echo "run=true"; echo "number=$number"; echo "base=$base"; echo "head=$head"; } >> "$GITHUB_OUTPUT"
 
     # The token is not kept in the checkout, because the model can read files there.
     # actions/checkout refuses a fork's code under pull_request_target unless told it may: the
@@ -130,7 +154,98 @@ runs:
         repo="$GITHUB_WORKSPACE/rev-engine-prime-checkout"
         auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
         git -C "$repo" -c "http.extraheader=AUTHORIZATION: basic $auth" fetch --quiet --no-tags origin "$BASE"
-        git -C "$repo" diff "$BASE...$HEAD" > "$RUNNER_TEMP/rev-engine-prime/pr/diff.patch"
+        # Paths as themselves, so a name outside ASCII is the same in the diff as in the checkout.
+        git -C "$repo" -c core.quotePath=false diff "$BASE...$HEAD" > "$RUNNER_TEMP/rev-engine-prime/pr/diff.patch"
+
+    # A later review by the shape reads from the head its last review read, when that head is an ancestor of this
+    # one, so it reads only what changed since; otherwise it reads the whole pull request. Each of its summaries
+    # names its label and head, and its round counts on from the last.
+    - name: Find the review's round
+      id: round
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        NUMBER: ${{ steps.ask.outputs.number }}
+        BASE: ${{ steps.ask.outputs.base }}
+        HEAD: ${{ steps.ask.outputs.head }}
+      run: |
+        set -euo pipefail
+        repo="$GITHUB_WORKSPACE/rev-engine-prime-checkout"
+        # A failed lookup fails the run, rather than starting the round count again at 1. A summary's own marker is
+        # the whole of its last line but one, so only such a line is read: one quoted elsewhere, as by the other review,
+        # or inside a line of model text, isn't.
+        gh api --paginate "repos/$REPO/pulls/$NUMBER/reviews" --jq '.[] | select(.user.login == "github-actions[bot]") | [.body | split("\n")[] | select(length > 0)] | .[-2] // ""' > "$RUNNER_TEMP/rev-engine-prime/reviews.txt"
+        last=$(grep -xE '<!-- rev-engine-shape-review [A-Za-z0-9._-]+-[0-9]+ [0-9a-f]{40} -->' "$RUNNER_TEMP/rev-engine-prime/reviews.txt" | tail -n 1 || true)
+        round=1; round_of=""; base="$BASE"
+        if [ -n "$last" ]; then
+          label=$(awk '{print $3}' <<<"$last"); reviewed=$(awk '{print $4}' <<<"$last")
+          round=$(( 10#${label##*-} + 1 ))
+          if [ "$reviewed" != "$HEAD" ] && git -C "$repo" merge-base --is-ancestor "$reviewed" "$HEAD" 2>/dev/null; then
+            round_of="$label"; base="$reviewed"
+            git -C "$repo" -c core.quotePath=false diff "$reviewed" "$HEAD" > "$RUNNER_TEMP/rev-engine-prime/pr/diff.patch"
+          fi
+        fi
+        echo "::notice::Review round $round${round_of:+, reading from the head of $round_of, $base}"
+        { echo "round=$round"; echo "round-of=$round_of"; echo "base=$base"; } >> "$GITHUB_OUTPUT"
+
+    # Installed by a job of its own, with no secrets, so a fork's package configuration never runs beside them.
+    # What the pull request has at node_modules or .consumers, a link included, goes before anything is placed there:
+    # a link would carry the download or the clones out of the checkout, and either would pass for what the review
+    # installed or checked out.
+    - name: Clear the places the review fills
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape'
+      shell: bash
+      run: rm -rf "$GITHUB_WORKSPACE/rev-engine-prime-checkout/node_modules" "$GITHUB_WORKSPACE/rev-engine-prime-checkout/.consumers"
+
+    - name: Place the installed dependencies
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape' && inputs.dependencies != '' && inputs.dependencies-head == steps.ask.outputs.head
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.dependencies }}
+        # The artifact holds node_modules' contents, since an upload of one directory is rooted inside it.
+        path: rev-engine-prime-checkout/node_modules
+
+    - name: Say why the dependencies aren't placed
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape' && inputs.dependencies != '' && inputs.dependencies-head != steps.ask.outputs.head
+      shell: bash
+      env:
+        DEPENDENCIES_HEAD: ${{ inputs.dependencies-head }}
+      run: |
+        if [ -z "$DEPENDENCIES_HEAD" ]; then echo "::notice::No dependencies-head was given, so the dependencies aren't placed and the review reads without them"
+        else echo "::notice::The head under review isn't dependencies-head, the head the dependencies were installed from (the pull request may have moved since), so the review reads without them"; fi
+
+    - name: Check out the consumers
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape' && inputs.consumers != ''
+      # A consumer that can't be cloned, or isn't named as owner/name, is said and left out; the others are still read.
+      continue-on-error: true
+      shell: bash
+      env:
+        CONSUMERS: ${{ inputs.consumers }}
+      run: |
+        set -euo pipefail
+        dir="$GITHUB_WORKSPACE/rev-engine-prime-checkout/.consumers"
+        mkdir "$dir"
+        for nwo in $CONSUMERS; do
+          [[ "$nwo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$nwo" != */.* && "$nwo" != .* ]] || { echo "::warning::consumers: \"$nwo\" is not owner/name, so it isn't read"; continue; }
+          dest="$dir/${nwo%%/*}__${nwo#*/}"
+          # Nothing a failed clone leaves behind is read as the consumer.
+          git clone --quiet --depth 1 "https://github.com/$nwo.git" "$dest" || { rm -rf "$dest"; echo "::warning::consumers: $nwo couldn't be cloned (a misspelt name, or a repository this job can't read), so the review reads without it"; }
+        done
+
+    # A review that stopped for any reason but a refusal, in a run GitHub let write the cache, kept its plan and answers
+    # here; the same pull request read from the same base to the same head goes on from them. The review takes them only
+    # if they are its own round's.
+    - name: Restore a stopped review's answers
+      id: kept
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/rev-engine-prime/kept
+        key: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}
+        restore-keys: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-
 
     - name: Build the reviewer
       if: steps.ask.outputs.run == 'true'
@@ -153,11 +268,12 @@ runs:
         docker run --rm --entrypoint node \
           -v "$GITHUB_ACTION_PATH/action:/agent/action:ro" \
           -v "$RUNNER_TEMP/rev-engine-prime/pr:/work/pr" \
-          -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_GRAPHQL_URL -e RB_NWO -e RB_PR_NUMBER -e PRIOR_PATH=/work/pr/prior.json \
+          -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_GRAPHQL_URL -e RB_NWO -e RB_PR_NUMBER -e PRIOR_PATH=/work/pr/prior.json -e DECISIONS_PATH=/work/pr/decisions.jsonl \
           rev-engine-prime:action /agent/action/collect.ts \
           || echo "::warning::Earlier decisions not collected: the collector exited with an error"
 
     - name: Review
+      id: review
       if: steps.ask.outputs.run == 'true'
       shell: bash
       env:
@@ -168,9 +284,16 @@ runs:
         RB_MODEL_API_KEY: ${{ inputs.model-api-key }}
         RB_NWO: ${{ github.repository }}
         RB_PR_NUMBER: ${{ steps.ask.outputs.number }}
-        RB_BASE: ${{ steps.ask.outputs.base }}
+        RB_BASE: ${{ steps.round.outputs.base || steps.ask.outputs.base }}
         RB_HEAD: ${{ steps.ask.outputs.head }}
         RB_CONFIG_MODEL: ${{ inputs.model }}
+        SHAPE: ${{ inputs.pipeline == 'shape' && 'on' || '' }}
+        RB_SOL_BASE_URL: ${{ inputs.sol-base-url }}
+        RB_SHAPE_ROUND: ${{ steps.round.outputs.round }}
+        RB_SHAPE_ROUND_OF: ${{ steps.round.outputs.round-of }}
+        # Project rules are read from the pull request's base, never from an earlier head of the pull request itself.
+        RB_SHAPE_RULES_BASE: ${{ steps.ask.outputs.base }}
+        KEPT: ${{ steps.kept.outputs.cache-matched-key }}
         RB_CONFIG_TIME_BUDGET: ${{ inputs.time-budget }}
         RB_CONFIG_FIT: ${{ inputs.fit == 'on' && inputs.model || '' }}
       run: |
@@ -178,7 +301,16 @@ runs:
         # An endpoint of your own is reached the way the runner reaches it, such as over a VPN the job joined.
         network=()
         if [ -n "$RB_MODEL_BASE_URL" ]; then network=(--network host); fi
-        docker run --rm "${network[@]}" \
+        # The review shape: its settings, background-class model calls, and a stopped review's answers when restored.
+        shape=()
+        if [ -n "$SHAPE" ]; then
+          export RB_MODEL_HEADERS
+          RB_MODEL_HEADERS=$(jq -cn --arg tag "rev-engine/$RB_NWO#$RB_PR_NUMBER" '{"x-orca-class": "batch", "x-caller-tag": $tag}')
+          shape=(-e RB_CONFIG_SHAPE=on -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT -e RB_SOL_BASE_URL -e RB_SHAPE_ROUND -e RB_SHAPE_ROUND_OF -e RB_SHAPE_RULES_BASE -e RB_MODEL_HEADERS -e RB_SHAPE_OUT=/work/out/shape)
+          if [ -n "$KEPT" ]; then shape+=(-v "$RUNNER_TEMP/rev-engine-prime/kept:/work/kept:ro" -e RB_SHAPE_KEPT=/work/kept -e RB_SHAPE_RESUMED_FROM="$KEPT"); fi
+        fi
+        status=0
+        docker run --rm "${network[@]}" "${shape[@]}" \
           -v "$GITHUB_WORKSPACE/rev-engine-prime-checkout:/work/repo:ro" \
           -v "$RUNNER_TEMP/rev-engine-prime/pr:/work/pr:ro" \
           -v "$RUNNER_TEMP/rev-engine-prime/out:/work/out" \
@@ -186,7 +318,82 @@ runs:
           -e RB_CONFIG_MODEL -e RB_CONFIG_TIME_BUDGET -e RB_CONFIG_FIT -e RB_DETAILS_OUT=/work/out/details.json \
           -e RB_REPO=/work/repo -e RB_DIFF=/work/pr/diff.patch -e RB_PR_JSON=/work/pr/pr.json -e RB_PRIOR_JSON=/work/pr/prior.json \
           -e RB_OUT=/work/out/findings.json -e RB_ATTEMPT=1 \
-          rev-engine-prime:action
+          rev-engine-prime:action || status=$?
+        # Exit 3 is the review shape stopping with its answers kept: Sol couldn't take its calls, a call was
+        # refused, or the job's time ran out. The steps below say so on the pull request.
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        if [ "$status" = 3 ]; then
+          # Read on lines of their own, so a stopped.json that can't be read fails the step rather than leave the stop
+          # empty, which would keep a refused review's answers.
+          stop=$(jq -er .reason "$RUNNER_TEMP/rev-engine-prime/out/stopped.json")
+          category=$(jq -r '.category // ""' "$RUNNER_TEMP/rev-engine-prime/out/stopped.json")
+          { echo "stop=$stop"; echo "category=$category"; } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        exit "$status"
+
+    # Every stop but a refusal keeps the answers where GitHub lets the run write its cache, so a later run of the same
+    # pull request at the same head goes on from them, whether a maintainer's /review starts it or a scheduled resume of
+    # one stopped for Sol or the time limit. GitHub lets a run started by a pull request or a comment restore the
+    # default branch's cache but not write it (its cache access for low-trust triggers), so such a stop keeps nothing
+    # new, and its first resume, a manual run, goes on from what an earlier run kept, if any; the runner names the access it gives in
+    # ACTIONS_CACHE_MODE. The cache's version comes from its paths, so the answers are saved from the path they're
+    # restored to. A run that stopped before it wrote its plan has nothing newer than what it restored, which stays in
+    # the cache as it was, so nothing is saved.
+    - name: Gather a stopped review's answers
+      id: gather
+      if: steps.review.outputs.status == '3' && steps.review.outputs.stop != 'refused'
+      shell: bash
+      run: |
+        set -euo pipefail
+        out="$RUNNER_TEMP/rev-engine-prime/out/shape"; kept="$RUNNER_TEMP/rev-engine-prime/kept"
+        [ -f "$out/shape-plan.json" ] || exit 0
+        case "${ACTIONS_CACHE_MODE:-}" in
+          write|write-only) ;;
+          "") [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { echo "readonly=true" >> "$GITHUB_OUTPUT"; exit 0; } ;;
+          *) echo "readonly=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+        esac
+        rm -rf "$kept" && cp -R "$out" "$kept" && echo "kept=true" >> "$GITHUB_OUTPUT"
+
+    - name: Keep a stopped review's answers
+      if: steps.gather.outputs.kept == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/rev-engine-prime/kept
+        key: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # A refusal is named by its category alone, never by what the provider said.
+    - name: Say that the review stopped
+      if: ${{ !cancelled() && steps.review.outputs.status == '3' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        NUMBER: ${{ steps.ask.outputs.number }}
+        STOP: ${{ steps.review.outputs.stop }}
+        CATEGORY: ${{ steps.review.outputs.category }}
+        KEPT: ${{ steps.gather.outputs.kept }}
+        READONLY: ${{ steps.gather.outputs.readonly }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        # What it read is kept in GitHub's cache, which drops an entry unused for a week, or sooner when the
+        # repository's cache is full.
+        # Only a stop that gathered answers to keep says so; one with nothing to keep (no plan written, none restored) doesn't.
+        kept="A later run of this head from the same base, which a /review comment from someone with write access starts, goes on from what an earlier run of it kept, if any, or reads it from the start."
+        if [ "${READONLY:-}" = true ]; then kept="GitHub's cache didn't let this run keep what it read (a run started by a pull request or a comment can't). A later run of this head from the same base, which a /review comment from someone with write access starts, goes on from what an earlier run of it kept, if any, or reads it from the start."; fi
+        if [ "${KEPT:-}" = true ]; then kept="It keeps what it has read for a later run of this head from the same base, which a /review comment from someone with write access starts, for as long as GitHub's cache holds it (up to a week unused)."; fi
+        # GitHub's cache serves a run only what its own branch or the default branch saved, so what a manual run on
+        # another branch kept is that branch's.
+        if [ "${KEPT:-}" = true ] && [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then kept="It keeps what it has read, for as long as GitHub's cache holds it (up to a week unused), for a later manual run of this head on ${GITHUB_REF#refs/heads/}; a /review comment runs on the default branch, where what this run kept isn't, and goes on from what a run there kept, if any, or reads it from the start."; fi
+        case "$STOP" in
+          sol-unavailable) body="This review stopped before it finished, because Sol, one of its two readers, couldn't take its calls. $kept" ;;
+          time) body="This review stopped at its own time limit, set inside the job's, before it finished. $kept" ;;
+          refused) body="This review stopped: the model provider refused one of its calls (category: $CATEGORY). It won't go on by itself, and a /review may meet the same refusal." ;;
+          *) body="This review stopped before it finished, and won't go on by itself. $kept" ;;
+        esac
+        gh pr comment "$NUMBER" --repo "$REPO" --body "$body The run: $RUN"
 
     # Keep the findings with their severities and kinds, so a review can later be
     # turned into an eval case with evals/add.ts. They hold nothing the posted review does not.
@@ -201,7 +408,7 @@ runs:
     # The posting script runs in the same image so the runner needs no Node of its own.
     # It gets the GitHub token and no model key; the review above gets the model key and no GitHub token.
     - name: Post the review
-      if: steps.ask.outputs.run == 'true'
+      if: steps.ask.outputs.run == 'true' && steps.review.outputs.status != '3'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -210,14 +417,29 @@ runs:
         RB_NWO: ${{ github.repository }}
         RB_PR_NUMBER: ${{ steps.ask.outputs.number }}
         RB_HEAD: ${{ steps.ask.outputs.head }}
+        SHAPE: ${{ inputs.pipeline == 'shape' && 'on' || '' }}
         REVIEW_MODEL: ${{ inputs.model }}
         MIN_SEVERITY: ${{ inputs.min-severity }}
         MAX_COMMENTS: ${{ inputs.max-findings }}
       run: |
         set -euo pipefail
-        docker run --rm --entrypoint node \
+        # The shape's review is posted from its own result, and each area's run directory gets the comment ids.
+        shape=()
+        if [ -n "$SHAPE" ]; then shape=(-v "$RUNNER_TEMP/rev-engine-prime/out/shape:/work/out/shape" -e SHAPE_PATH=/work/out/shape/shape-review.json -e SHAPE_OUT=/work/out/shape); fi
+        docker run --rm --entrypoint node "${shape[@]}" \
           -v "$GITHUB_ACTION_PATH/action:/agent/action:ro" \
           -v "$RUNNER_TEMP/rev-engine-prime:/work:ro" \
           -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_GRAPHQL_URL -e RB_NWO -e RB_PR_NUMBER -e RB_HEAD -e REVIEW_MODEL -e MIN_SEVERITY -e MAX_COMMENTS \
           -e FINDINGS_PATH=/work/out/details.json -e FIT_PATH=/work/out/fit.json -e DIFF_PATH=/work/pr/diff.patch \
           rev-engine-prime:action /agent/action/post.ts
+
+    # The shape's run directories, for a record of the reviews: kept whether the review finished or stopped,
+    # after the post, which adds each comment's id.
+    - name: Save the review shape's run
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape' && !cancelled()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.round.outputs.round }}
+        path: ${{ runner.temp }}/rev-engine-prime/out/shape
+        if-no-files-found: ignore
+        overwrite: true

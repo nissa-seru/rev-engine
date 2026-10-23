@@ -91,6 +91,8 @@ interface Statement {
   reason: string;
   at: string;
   source: string;
+  /** Who decided: the account that replied, resolved the thread or wrote the evaluation. */
+  by: string;
 }
 
 interface Finding {
@@ -100,7 +102,9 @@ interface Finding {
   round: number;
   order: number;
   statements: Statement[];
-  resolved: { source: string } | null;
+  resolved: { source: string; by: string } | null;
+  /** The id of the thread's first comment, the action's own, when the finding is a thread. */
+  comment: number | null;
 }
 
 // The decision word must end the reply or be followed by punctuation or a space, so "Fixed? Not sure" does not count.
@@ -124,7 +128,7 @@ function replyDecision(word: string): Decision {
 export function findingTitle(body: string): string {
   const first = body.trim().split("\n")[0] ?? "";
   const bold = /^\*\*(.+?)\*\*/.exec(first)?.[1] ?? first;
-  return bold.replace(/^(high|medium|low) severity(, [\w -]+)?\.\s*/i, "").trim();
+  return bold.replace(/^((high|medium|low) severity|blocker|should fix|minor)(, [\w -]+)?\.\s*/i, "").trim();
 }
 
 /** Text with its links reduced to their words and cut to MAX_REASON_CHARS. */
@@ -229,6 +233,20 @@ export function fitAnswer(body: string): { verdict: FitAnswer["verdict"]; text: 
   };
 }
 
+/** A finding's latest decision as a decisions-file entry, with who decided it and when, or null when nobody did. */
+function decidedFinding(finding: Finding): { entry: Omit<PriorEntry, "id">; comment: number | null; by: string; at: string } | null {
+  const latest = [...finding.statements].sort((a, b) => a.at.localeCompare(b.at)).at(-1);
+  const chosen = latest ?? (finding.resolved ? { decision: "resolved" as const, reason: "", source: finding.resolved.source, by: finding.resolved.by, at: "" } : null);
+  if (!chosen || !finding.title) return null;
+  return {
+    comment: finding.comment, by: chosen.by, at: chosen.at,
+    entry: {
+      file: finding.file, ...(finding.linesHint ? { lines_hint: finding.linesHint } : {}), title: finding.title,
+      decision: chosen.decision, ...(chosen.reason ? { reason: chosen.reason } : {}), round: finding.round, source: chosen.source,
+    },
+  };
+}
+
 /** Keeps the decisions that suppress repeats first, then the newest rounds, up to the cap. */
 function capped(findings: Array<{ entry: Omit<PriorEntry, "id">; order: number }>): { kept: typeof findings; omitted: number } {
   // Resolved findings come back when the problem is still there, like partly fixed ones, so they go after the suppressing decisions.
@@ -245,6 +263,38 @@ function capped(findings: Array<{ entry: Omit<PriorEntry, "id">; order: number }
  * left out, because nobody decided them.
  */
 export function collectDecisions(sources: Sources): PriorDecisions {
+  const { findings, fitByRound } = gather(sources);
+  const decided = [...findings.values()].flatMap((finding) => {
+    const one = decidedFinding(finding);
+    return one ? [{ order: finding.order, entry: one.entry }] : [];
+  });
+  const { kept, omitted } = capped(decided);
+  const fit = [...fitByRound.values()].sort((a, b) => a.round - b.round).slice(-MAX_FIT_ANSWERS);
+  return { entries: kept.map(({ entry }, index) => ({ id: `P${index + 1}`, ...entry })), omitted, ...(fit.length ? { fit } : {}) };
+}
+
+/** A decision on one of the action's own line comments: the comment, what was decided, by whom and when. */
+export interface CommentDecision {
+  comment: number;
+  decision: Decision;
+  by: string;
+  at: string;
+}
+
+/**
+ * The standing decision on each of the action's own line comments (its latest stated one, else its thread's
+ * resolution), uncapped, from the same sources and rules as the decisions file: what the review shape records
+ * against each issue, which its comment's marker names.
+ */
+export function commentDecisions(sources: Sources): CommentDecision[] {
+  return [...gather(sources).findings.values()].flatMap((finding) => {
+    const one = decidedFinding(finding);
+    return one && one.comment !== null ? [{ comment: one.comment, decision: one.entry.decision, by: one.by, at: one.at }] : [];
+  });
+}
+
+/** The action's findings with what was said about them, and the fit answers by round. */
+function gather(sources: Sources): { findings: Map<string, Finding>; fitByRound: Map<number, FitAnswer> } {
   const ours = sources.reviews
     .filter((review) => review.author === sources.bot && review.body.includes(MARKER))
     .sort((a, b) => a.submittedAt.localeCompare(b.submittedAt));
@@ -262,12 +312,13 @@ export function collectDecisions(sources: Sources): PriorDecisions {
       if (!sources.canDecide(reply.author)) continue;
       const match = REPLY.exec(reply.body);
       if (!match) continue;
-      statements.push({ decision: replyDecision(match[1]!), reason: shortReason(reply.body.slice(match[0].length)), at: reply.createdAt, source: reply.url });
+      statements.push({ decision: replyDecision(match[1]!), reason: shortReason(reply.body.slice(match[0].length)), at: reply.createdAt, source: reply.url, by: reply.author });
     }
     const lines = thread.line === null ? undefined : `${thread.startLine ?? thread.line}-${thread.line}${thread.commit ? ` at ${thread.commit.slice(0, 7)}` : ""}`;
     findings.set(`c${first.id}`, {
       file: thread.path, ...(lines ? { linesHint: lines } : {}), title: findingTitle(first.body), round, order: order++, statements,
-      resolved: thread.isResolved && thread.resolvedBy && sources.canDecide(thread.resolvedBy) ? { source: first.url } : null,
+      resolved: thread.isResolved && thread.resolvedBy && sources.canDecide(thread.resolvedBy) ? { source: first.url, by: thread.resolvedBy } : null,
+      comment: first.id,
     });
   }
 
@@ -283,26 +334,10 @@ export function collectDecisions(sources: Sources): PriorDecisions {
     for (const line of evaluationLines(comment.body)) {
       const decision = evaluationDecision(line.label, line.reason);
       const key = line.commentId !== null && findings.has(`c${line.commentId}`) ? `c${line.commentId}` : `e${round}:${line.title.toLowerCase()}`;
-      const existing = findings.get(key) ?? { file: line.file, title: line.title, round, order: order++, statements: [], resolved: null };
-      if (decision) existing.statements.push({ decision, reason: shortReason(line.reason), at: comment.createdAt, source: comment.url });
+      const existing = findings.get(key) ?? { file: line.file, title: line.title, round, order: order++, statements: [], resolved: null, comment: null };
+      if (decision) existing.statements.push({ decision, reason: shortReason(line.reason), at: comment.createdAt, source: comment.url, by: comment.author });
       findings.set(key, existing);
     }
   }
-
-  const decided: Array<{ entry: Omit<PriorEntry, "id">; order: number }> = [];
-  for (const finding of findings.values()) {
-    const latest = [...finding.statements].sort((a, b) => a.at.localeCompare(b.at)).at(-1);
-    const chosen = latest ?? (finding.resolved ? { decision: "resolved" as const, reason: "", source: finding.resolved.source } : null);
-    if (!chosen || !finding.title) continue;
-    decided.push({
-      order: finding.order,
-      entry: {
-        file: finding.file, ...(finding.linesHint ? { lines_hint: finding.linesHint } : {}), title: finding.title,
-        decision: chosen.decision, ...(chosen.reason ? { reason: chosen.reason } : {}), round: finding.round, source: chosen.source,
-      },
-    });
-  }
-  const { kept, omitted } = capped(decided);
-  const fit = [...fitByRound.values()].sort((a, b) => a.round - b.round).slice(-MAX_FIT_ANSWERS);
-  return { entries: kept.map(({ entry }, index) => ({ id: `P${index + 1}`, ...entry })), omitted, ...(fit.length ? { fit } : {}) };
+  return { findings, fitByRound };
 }

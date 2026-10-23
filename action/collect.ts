@@ -1,15 +1,22 @@
 // Collects the maintainer's decisions on earlier reviews of a pull request into
 // prior.json, so the next review does not report decided findings again. It holds
-// the GitHub token and no model key. Any failure is logged as a warning and leaves
-// no file, so the review runs as it would have without earlier decisions.
+// the GitHub token and no model key. A failure to collect is logged as a warning and
+// leaves no file, so the review runs as it would have without earlier decisions; a
+// failure to write the decisions record alone is said apart and costs prior.json nothing.
 //
-//   PRIOR_PATH=<file> node action/collect.ts [--before <ISO time>]
+//   PRIOR_PATH=<file> [DECISIONS_PATH=<file>] node action/collect.ts [--before <ISO time>]
+//
+// DECISIONS_PATH, when set, also gets the standing decision on each of the review shape's marked comments (its
+// latest stated one, from a reply or a review evaluation that links the comment, else its thread's resolution), one
+// JSON line each (review label, issue, comment id, decision, who, and when, where GitHub gives a time; a resolution
+// has none), for a record of what maintainers decided.
 //
 // --before ignores everything posted after that time, to rebuild what an earlier
 // review would have been given.
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { collectDecisions, type IssueComment, type ReviewRecord, type ThreadRecord } from "./decisions.ts";
+import { collectDecisions, commentDecisions, type IssueComment, type ReviewRecord, type ThreadRecord } from "./decisions.ts";
+import { markedIssue } from "./shape.ts";
 
 const BOT = "github-actions[bot]";
 
@@ -157,7 +164,28 @@ try {
   ]);
   await Promise.all([...accounts].map(canDecide));
 
-  const prior = collectDecisions({ reviews, threads: threadList, comments, bot: BOT, canDecide: (account) => permissions.get(account) === true });
+  const sources = { reviews, threads: threadList, comments, bot: BOT, canDecide: (account: string) => permissions.get(account) === true };
+  const prior = collectDecisions(sources);
+  // For the review shape: the standing decision on each comment whose marker names its issue, one line each, for the
+  // record of what maintainers decided (DECISIONS_PATH). Comments without a marker are the other review's.
+  // A failure here is said apart, so it costs the shape's record and never the review's prior.json below.
+  const decisionsPath = process.env.DECISIONS_PATH?.trim();
+  if (decisionsPath) {
+    try {
+      const bodies = new Map(threadList.flatMap((thread) => thread.comments.slice(0, 1).map((comment) => [comment.id, comment.body] as const)));
+      const lines = commentDecisions(sources).flatMap((decided) => {
+        const marked = markedIssue(bodies.get(decided.comment) ?? "");
+        return marked ? [JSON.stringify({ review: marked.label, issue: marked.issue, comment: decided.comment, decision: decided.decision, by: decided.by, at: decided.at || null })] : [];
+      });
+      if (lines.length) {
+        await mkdir(dirname(decisionsPath), { recursive: true });
+        await writeFile(decisionsPath, `${lines.join("\n")}\n`);
+        console.error(`collect: ${lines.length} decision(s) on the review shape's comments`);
+      }
+    } catch (error) {
+      console.log(`::warning::Decisions on the review shape's comments not recorded: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   if (!prior.entries.length && !prior.fit?.length) {
     console.error("collect: no earlier decisions on this pull request");
   } else {

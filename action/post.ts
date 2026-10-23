@@ -1,7 +1,9 @@
 // Posts the findings of one run to the pull request as a single review.
-import { readFile } from "node:fs/promises";
-import { buildReview, MARKER, parseHunks, withoutLineComments, type ExistingComment, type Finding, type Fit, type ReviewInput, type ReviewParts, type Severity } from "./comments.ts";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { buildReview, MARKER, parseHunks, quietParts, withoutLineComments, type ExistingComment, type Finding, type Fit, type ReviewInput, type ReviewParts, type Severity } from "./comments.ts";
 import { isDecisionReply } from "./decisions.ts";
+import { buildShapeReview, markedIssue, type ShapeInput, type ShapeReview } from "./shape.ts";
 
 const log = (message: string): void => console.error(`post: ${message}`);
 
@@ -106,7 +108,7 @@ async function linkComments(input: ReviewInput, parts: ReviewParts, review: numb
     if (!response.ok) throw new Error(`listing the review's comments failed with status ${response.status}`);
     const posted = await response.json() as Array<{ path: string; body: string; html_url: string }>;
     const links = parts.comments.map((comment) => posted.find((other) => other.path === comment.path && other.body.trim() === comment.body.trim())?.html_url);
-    const update = await github("PUT", `/pulls/${number}/reviews/${review}`, { body: buildReview(input, links).body });
+    const update = await github("PUT", `/pulls/${number}/reviews/${review}`, { body: quietParts(buildReview(input, links)).body });
     if (!update.ok) throw new Error(`updating the summary failed with status ${update.status}`);
   } catch (error) {
     log(`the summary has no links to its comments: ${error instanceof Error ? error.message : String(error)}`);
@@ -122,11 +124,64 @@ async function optionalJson<T>(path: string | undefined): Promise<T | null> {
   }
 }
 
+/**
+ * The review shape's review: posted, then its summary relinked to its comments, and each area's posted.json written
+ * with the comment each issue got, for a record of the reviews. A failure after the post leaves the review as posted.
+ */
+async function postShape(review: ShapeReview, minSeverity: Severity, maxComments: number, diff: string, outDir: string | undefined): Promise<void> {
+  const input: ShapeInput = { review, hunks: parseHunks(diff), existing: await existingComments(), settled: await settledComments(), minSeverity, maxComments };
+  const parts = quietParts(buildShapeReview(input));
+  let inline = parts.comments.length > 0;
+  let response = await submit(parts);
+  if (response.status === 422 && parts.comments.length) {
+    // Sent again with no line comments: the summary, built for none, lists every issue's text inside its size limit.
+    log(`GitHub rejected the line comments: ${(await response.text()).slice(0, 500)}`);
+    response = await submit(quietParts(buildShapeReview({ ...input, maxComments: 0 })));
+    inline = false;
+  }
+  if (!response.ok) throw new Error(`posting the review failed with status ${response.status}: ${(await response.text()).slice(0, 500)}`);
+  const id = (await response.json() as { id: number }).id;
+  log(`posted the review shape's review with ${inline ? parts.comments.length : 0} line comment(s) on ${nwo}#${number}`);
+  if (!inline) return;
+  try {
+    const listed = await github("GET", `/pulls/${number}/reviews/${id}/comments?per_page=100`);
+    if (!listed.ok) throw new Error(`listing the review's comments failed with status ${listed.status}`);
+    const posted = await listed.json() as Array<{ id: number; path: string; body: string; html_url: string }>;
+    // Which comment each issue got is written first, so a failed summary update below loses none of it.
+    if (outDir) {
+      const byLabel = new Map<string, Record<string, number>>();
+      for (const comment of posted) {
+        const marked = markedIssue(comment.body);
+        if (!marked) continue;
+        byLabel.set(marked.label, { ...byLabel.get(marked.label), [marked.issue]: comment.id });
+      }
+      // A record that can't be written leaves the summary's update to go on.
+      for (const [label, issues] of byLabel) {
+        await mkdir(join(outDir, label), { recursive: true })
+          .then(() => writeFile(join(outDir, label, "posted.json"), `${JSON.stringify(issues, null, 1)}\n`))
+          .catch((error: unknown) => log(`${label}'s posted.json couldn't be written: ${error instanceof Error ? error.message : String(error)}`));
+      }
+    }
+    const links = parts.comments.map((comment) => posted.find((other) => other.path === comment.path && other.body.trim() === comment.body.trim())?.html_url);
+    const update = await github("PUT", `/pulls/${number}/reviews/${id}`, { body: quietParts(buildShapeReview(input, links)).body });
+    if (!update.ok) log(`the summary has no links to its comments: updating it failed with status ${update.status}`);
+  } catch (error) {
+    log(`after posting: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 try {
   const minSeverity = (process.env.MIN_SEVERITY?.trim() || "medium") as Severity;
   if (!["high", "medium", "low"].includes(minSeverity)) throw new Error("min-severity must be high, medium or low");
   const maxComments = Number(process.env.MAX_COMMENTS?.trim() || "10");
   if (!Number.isInteger(maxComments) || maxComments < 0) throw new Error("max-findings must be a whole number");
+  // A shape run that has no result to post is a failure to say, not a reason to look for the other review's.
+  const shapePath = process.env.SHAPE_PATH?.trim();
+  const shape = shapePath ? JSON.parse(await readFile(shapePath, "utf8")) as ShapeReview : null;
+  if (shape) {
+    await postShape(shape, minSeverity, maxComments, await readFile(required("DIFF_PATH"), "utf8"), process.env.SHAPE_OUT?.trim() || undefined);
+    process.exit(0);
+  }
   const output = JSON.parse(await readFile(required("FINDINGS_PATH"), "utf8")) as { findings: Finding[]; decided?: Array<{ repeat_of?: unknown }> };
   const fit = await optionalJson<Fit>(process.env.FIT_PATH);
   const diff = await readFile(required("DIFF_PATH"), "utf8");
@@ -135,7 +190,7 @@ try {
     model: process.env.REVIEW_MODEL?.trim() || "a model", minSeverity, maxComments,
     decided: (output.decided ?? []).flatMap((repeat) => typeof repeat.repeat_of === "string" ? [repeat.repeat_of] : []),
   };
-  const parts = buildReview(input);
+  const parts = quietParts(buildReview(input));
 
   let inline = parts.comments.length > 0;
   let response = await submit(parts);

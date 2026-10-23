@@ -10,12 +10,21 @@
 #
 # Pull requests from forks are reviewed through pull_request_target, which runs this
 # workflow as the base branch has it, with the repository's secrets. Their code is checked
-# out as data and only read: nothing from the pull request is built or run.
+# out as data and only read: nothing from the pull request is built or run with those secrets,
+# or outside a container. The dependencies job's install runs in a container that sees only
+# the checkout, where an npm configuration the pull request carries can still run a program of
+# its choosing; that job has no secrets and no tailnet, and its token can only read.
 #
 # The caller's repository or organization provides variables TS_CLIENT_ID and TS_AUDIENCE
 # (the federated identity), MODEL_HOST (the endpoint's tailnet address, which the join waits
 # to reach) and MODEL_BASE_URL (the endpoint's base URL for Anthropic Messages), and the
 # secret MODEL_API_KEY.
+#
+# With the variable REVIEW_PIPELINE set to "shape", the review is the review shape (src/shape),
+# which also needs SOL_BASE_URL (the endpoint's base URL for OpenAI Responses), may take up to
+# the job's six hours, and reads the head's dependencies, installed by a job of their own.
+# REVIEW_CONSUMERS optionally names public repositories that rely on this one, as owner/name
+# separated by spaces. Without REVIEW_PIPELINE, it is RevEngine's own reviewer, as before.
 name: RevEngine review
 on:
   workflow_call:
@@ -32,7 +41,7 @@ on:
       MODEL_API_KEY:
         required: true
 jobs:
-  review:
+  who:
     if: >-
       (github.event_name == 'pull_request_target' && !github.event.pull_request.draft &&
        contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action) &&
@@ -42,11 +51,10 @@ jobs:
        (startsWith(github.event.comment.body, '/review ') || github.event.comment.body == '/review')) ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # Runs for one pull request queue rather than overlap. The comment gate above keeps a stranger's
-    # /review out of the queue, where it would replace a pending review.
-    concurrency:
-      group: rev-engine-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr-number }}
+    timeout-minutes: 5
+    outputs:
+      allowed: ${{ steps.who.outputs.allowed }}
+      head: ${{ steps.head.outputs.head }}
     steps:
       # A comment or a manual run asks as a person, who needs write access; the action checks this
       # too, but only after the join, so it's checked here first. A pull request event asks as
@@ -67,8 +75,105 @@ jobs:
             *) echo "::notice::No review: $ACTOR does not have write access to $REPO" ;;
           esac
 
+      # The head the dependencies are installed from, for the review shape.
+      - name: Find the head
+        id: head
+        if: steps.who.outputs.allowed == 'true' && vars.REVIEW_PIPELINE == 'shape'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ inputs.pr-number || github.event.pull_request.number || github.event.issue.number }}
+        # A failed lookup fails the run, rather than installing from an empty ref.
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/$REPO/pulls/$NUMBER" --jq .head.sha)
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::pull request $NUMBER has no head commit in its answer"; exit 1; }
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+  # The review shape's readers read dependencies' source, installed here with scripts off: from the head's bun or npm
+  # lockfile, or, when its root has a package.json and no lockfile at all, from package.json's ranges. A fork's package
+  # manager reads the fork's own configuration, so the install runs in a job of its own, with no secrets, no tailnet,
+  # and a token that can only read, kept out of the checkout. A failed install, a yarn or pnpm lockfile with neither
+  # of those, or no package.json leaves the review to read without dependencies.
+  dependencies:
+    needs: who
+    if: needs.who.outputs.allowed == 'true' && vars.REVIEW_PIPELINE == 'shape'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      contents: read
+    # Whether there is an artifact to place, so a review whose dependencies job passed nothing on doesn't try to.
+    outputs:
+      passed: ${{ steps.pass.outcome == 'success' }}
+    steps:
+      # checkout refuses a fork's code under pull_request_target unless told it may, since the danger is
+      # running that code with the repository's secrets. This job has none, and runs no script of it on the runner:
+      # the install below runs in a container that sees only the checkout.
+      - name: Check out the head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.who.outputs.head }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      # Scripts off doesn't keep a fork's package configuration from running code: its .npmrc can name the git
+      # program npm runs for a git dependency. So the install runs in a container that sees only the checkout, not
+      # the runner's actions, tools or processes, whose runtime token would let code poison the repository's caches.
+      - name: Install the dependencies, scripts off, in a container
+        id: install
+        run: |
+          set -euo pipefail
+          ranges=""
+          # Each lockfile by its own installer. A yarn or pnpm lockfile, with neither bun's nor npm's beside it, isn't
+          # installed from, since npm would ignore its pins: only a root with no lockfile at all takes package.json's ranges.
+          # What the head itself has at node_modules goes first, so only what this install puts there is passed on.
+          rm -rf node_modules
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            image=oven/bun:1; install=(bun install --frozen-lockfile --ignore-scripts)
+          elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            image=node:24; install=(npm ci --ignore-scripts --no-audit --no-fund)
+          elif [ -f yarn.lock ] || [ -f pnpm-lock.yaml ]; then
+            echo "::notice::The head's only lockfile is yarn's or pnpm's, which this job doesn't install from, so the review reads without dependencies"
+            exit 0
+          elif [ -f package.json ]; then
+            # No lockfile: the versions come from package.json's ranges, which may not be the ones the author ran, so
+            # a marker tells the review to say so. No lockfile is written.
+            image=node:24; install=(npm install --ignore-scripts --no-audit --no-fund --no-package-lock); ranges=true
+          else
+            echo "::notice::No package.json at the root, so the review reads without dependencies"
+            exit 0
+          fi
+          docker run --rm -v "$PWD:/work" -w /work --user "$(id -u):$(id -g)" -e HOME=/tmp "$image" "${install[@]}"
+          # A package.json that names no dependencies can leave no node_modules at all.
+          if [ ! -d node_modules ]; then echo "::notice::The install left no node_modules, so there are no dependencies to pass on"; exit 0; fi
+          if [ -n "$ranges" ]; then touch node_modules/.installed-from-ranges; fi
+          # A lockfile can make node_modules/<x> a link to a path of its choosing, even with scripts off, and the
+          # upload follows links: one into /proc/self would carry the uploading step's own environment, its runtime
+          # token among it, into the artifact. So no link leaves this job; the readers skip links anyway.
+          find node_modules -type l -delete
+          if [ -n "$(find node_modules -type l -print -quit)" ]; then echo "::error::links remain in node_modules"; exit 1; fi
+          echo "installed=true" >> "$GITHUB_OUTPUT"
+      - name: Pass them on
+        id: pass
+        if: steps.install.outputs.installed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rev-engine-dependencies
+          path: node_modules
+          include-hidden-files: true
+          retention-days: 1
+
+  review:
+    needs: [who, dependencies]
+    if: ${{ !cancelled() && needs.who.outputs.allowed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ vars.REVIEW_PIPELINE == 'shape' && 360 || 30 }}
+    # Runs for one pull request queue rather than overlap. The comment gate above keeps a stranger's
+    # /review out of the queue, where it would replace a pending review.
+    concurrency:
+      group: rev-engine-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr-number }}
+    steps:
       - name: Join the tailnet
-        if: steps.who.outputs.allowed == 'true'
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:
           oauth-client-id: ${{ vars.TS_CLIENT_ID }}
@@ -77,7 +182,6 @@ jobs:
           ping: ${{ vars.MODEL_HOST }}
 
       - name: Review
-        if: steps.who.outputs.allowed == 'true'
         uses: nissa-seru/rev-engine@main
         with:
           model-base-url: ${{ vars.MODEL_BASE_URL }}
@@ -87,10 +191,17 @@ jobs:
           pr-number: ${{ inputs.pr-number }}
           allow-forks: "true"
           authors: any
+          pipeline: ${{ vars.REVIEW_PIPELINE || 'reader' }}
+          sol-base-url: ${{ vars.SOL_BASE_URL }}
+          # Named when the dependencies job passed them on; when it installed nothing or failed, the review reads
+          # without them.
+          dependencies: ${{ needs.dependencies.outputs.passed == 'true' && 'rev-engine-dependencies' || '' }}
+          dependencies-head: ${{ needs.who.outputs.head }}
+          consumers: ${{ vars.REVIEW_CONSUMERS }}
 
       # A review that stops partway otherwise shows only in the Actions tab.
       - name: Say that the review stopped
-        if: (failure() || cancelled()) && steps.who.outputs.allowed == 'true'
+        if: failure() || cancelled()
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

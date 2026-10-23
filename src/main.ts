@@ -1,11 +1,12 @@
 // Container entry point: review the mounted pull request and write the findings file.
 import { mkdir, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { describeSettings, loadConfig, type Config } from "./config.ts";
 import { createChat, emptyUsage, type Chat, type ChatMessage, type Usage } from "./llm.ts";
 import type { OutputFinding } from "./findings.ts";
 import { naiveReview } from "./naive.ts";
 import { review } from "./review.ts";
+import { shapeReview } from "./shape/run.ts";
 
 const log = (message: string): void => console.error(`agent: ${message}`);
 
@@ -68,6 +69,33 @@ try {
       return send(request);
     }
     : send;
+  if (config.shape) {
+    // The review shape asks Sol through Responses, with the same key and gateway headers as the Claude endpoint.
+    const sol = createChat({ apiKey: config.apiKey, baseUrl: config.shape.solBaseUrl, api: "responses", headers: config.headers, effort: null, usage, usageByCaller });
+    const outcome = await shapeReview({
+      config, claude: chat, sol, usageByCaller, log,
+      run: { outDir: config.shape.outDir, keptDir: config.shape.keptDir, label: config.shape.label, round: config.shape.round, roundOf: config.shape.roundOf },
+    });
+    logUsageByCaller();
+    if (outcome.stop) {
+      // Stopped with its answers kept in the run directories, to be resumed. A first attempt writes no findings file,
+      // which would claim a review that didn't happen; exit 3 tells the Action it stopped rather than failed.
+      log(`review stopped (${outcome.stop.reason}): ${outcome.stop.detail}`);
+      await mkdir(dirname(config.outPath), { recursive: true });
+      await writeFile(join(dirname(config.outPath), "stopped.json"), `${JSON.stringify(outcome.stop, null, 2)}\n`);
+      // As for any review: a repeat attempt that also gives no review writes an empty list, since a benchmark run
+      // with one pull request that never succeeds fails whole. The Action runs one attempt, which stops.
+      if (config.attempt >= 2) {
+        log(`attempt ${config.attempt} also stopped; writing an empty findings list`);
+        await write([]);
+        process.exit(0);
+      }
+      process.exit(3);
+    }
+    await write(outcome.findings);
+    log(`${outcome.findings.length} finding(s) written by the review shape; ${usage.calls} model call(s), ${Math.round((Date.now() - started) / 1000)}s`);
+    process.exit(0);
+  }
   // The swarm is a prototype kept outside src, so it is loaded only when it is turned on.
   const swarmReview = config.swarm ? (await import("../experiments/prototypes/swarm/review.ts")).swarmReview : null;
   const outcome = await (swarmReview ?? (config.naive ? naiveReview : review))(config, chat, log);

@@ -57,7 +57,7 @@ const MAX_INDEXED_FILES = 20_000;
 const MAX_FILES_LISTED = 25;
 
 /** Lock files and generated output are rarely worth a reviewer's turn. */
-export const GENERATED = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|poetry\.lock|composer\.lock|Gemfile\.lock)$|\.(min\.js|map|snap|lock)$/;
+export const GENERATED = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|Cargo\.lock|go\.sum|poetry\.lock|composer\.lock|Gemfile\.lock)$|\.(min\.js|map|snap|lock)$/;
 
 function fileList(files: string[]): string {
   const listed = files.slice(0, MAX_FILES_LISTED).map((file) => `- ${file}`).join("\n");
@@ -191,7 +191,8 @@ export async function loadRules(workspace: Workspace): Promise<ProjectRule[]> {
   const rules: ProjectRule[] = [];
   let total = 0;
   for (const path of RULE_FILES) {
-    const text = (await workspace.baseFile(path))?.trim();
+    // A rule file too large to load is left out, as one that can't be read is.
+    const text = (await workspace.baseFile(path).catch(() => null))?.trim();
     if (!text || total >= MAX_RULES_TOTAL_CHARS) continue;
     const cut = text.slice(0, Math.min(MAX_RULE_CHARS, MAX_RULES_TOTAL_CHARS - total));
     total += cut.length;

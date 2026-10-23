@@ -139,7 +139,8 @@ const REPEAT_SIMILARITY = 0.45;
 
 /** An earlier comment's title and detail, without its severity label and marker. */
 function commentText(body: string): string {
-  return body.replace(MARKER, "").replace(/^\s*\*\*(high|medium|low) severity(, [\w -]+)?\.\s*/i, "");
+  // The review shape's comments lead with its own severity names and carry a marker of their issue.
+  return body.replace(/<!--[\s\S]*?-->/g, "").replace(/^\s*\*\*((high|medium|low) severity|blocker|should fix|minor)(, [\w -]+)?\.\s*/i, "");
 }
 
 /**
@@ -306,6 +307,21 @@ export function buildReview(input: ReviewInput, links: Array<string | undefined>
   }
   sections.push(`#### Findings\n\n${lines.join("\n\n")}`);
   return { body: `${sections.join("\n\n")}\n\n${MARKER}`, comments };
+}
+
+/**
+ * Text with each @-mention made inert by a zero-width space after the @, so a review never notifies someone that the
+ * reviewed code or a model's words name. Code spans and blocks are left as they are, since GitHub notifies nobody from
+ * them, and so are an @ inside a word, path or address, such as user@host or npm's @scope/name after a slash.
+ */
+export function quietMentions(text: string): string {
+  return text.split(/(```[\s\S]*?```|`[^`\n]*`)/).map((part, index) =>
+    index % 2 ? part : part.replace(/(^|[^\w/.@`])@(?=[A-Za-z0-9])/g, "$1@\u200b")).join("");
+}
+
+/** A review's summary and comments with their mentions made inert. */
+export function quietParts(parts: ReviewParts): ReviewParts {
+  return { body: quietMentions(parts.body), comments: parts.comments.map((comment) => ({ ...comment, body: quietMentions(comment.body) })) };
 }
 
 /** The same review with every comment moved into the summary, for when GitHub rejects a line. */

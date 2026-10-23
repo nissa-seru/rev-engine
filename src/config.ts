@@ -43,6 +43,11 @@ export interface Config extends Endpoint {
   naive: boolean;
   /** Replace the review with the swarm prototype in experiments/prototypes/swarm, which reads its own RB_CONFIG_SWARM_* settings. */
   swarm: boolean;
+  /**
+   * Replace the review with the review shape in src/shape: a planner, two batteries (Sol and haiku), a grouper, a
+   * judge and a severity check. Null when off.
+   */
+  shape: ShapeSettings | null;
   /** Findings less severe than this are dropped before verification. */
   minSeverity: Severity;
   /** A model that judges whether the change belongs in the project. Null for none. */
@@ -59,6 +64,27 @@ export interface Config extends Endpoint {
   /** Wall-clock budget for the whole run. */
   budgetMs: number;
   maxTurns: number;
+}
+
+/** The review shape's settings (docs/SETTINGS.md). */
+export interface ShapeSettings {
+  /** Where Sol is asked, an OpenAI Responses endpoint, with the same key as the main endpoint. */
+  solBaseUrl: string;
+  /** The directory each area's run directory is written under. */
+  outDir: string;
+  /** An earlier run's output directory of the same review, whose plan and answers are taken instead of asked again. */
+  keptDir: string | null;
+  /** Which review of this pull request this is, from 1. */
+  round: number;
+  /** The label of the review whose head this one reads from, when it reads from one. */
+  roundOf: string | null;
+  /**
+   * The commit project rules are read from: the pull request's base, which in a later round isn't the base the review
+   * reads from (an earlier head of the pull request itself).
+   */
+  rulesBase: string;
+  /** The review's label, re-<owner>.<name>-<pr>-<round>. */
+  label: string;
 }
 
 export const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
@@ -185,15 +211,35 @@ export function loadConfig(env: Env): Config {
   if (!["on", "off"].includes(swarm)) throw new Error("RB_CONFIG_SWARM must be on or off");
   if (naive === "on" && swarm === "on") throw new Error("RB_CONFIG_NAIVE and RB_CONFIG_SWARM cannot both be on");
 
+  const shapeOn = env.RB_CONFIG_SHAPE?.trim() || "off";
+  if (!["on", "off"].includes(shapeOn)) throw new Error("RB_CONFIG_SHAPE must be on or off");
+  if (shapeOn === "on" && (naive === "on" || swarm === "on")) throw new Error("RB_CONFIG_SHAPE cannot be on with RB_CONFIG_NAIVE or RB_CONFIG_SWARM");
+
   const minSeverity = (env.RB_CONFIG_MIN_SEVERITY?.trim() || "low") as Severity;
   if (!["high", "medium", "low"].includes(minSeverity)) throw new Error("RB_CONFIG_MIN_SEVERITY must be high, medium or low");
 
   const outPath = required(env, "RB_OUT");
 
   const endpoint = loadEndpoint(env);
+  const nwo = required(env, "RB_NWO");
+  let shape: ShapeSettings | null = null;
+  if (shapeOn === "on") {
+    if (endpoint.api !== "anthropic") throw new Error("RB_CONFIG_SHAPE=on asks its Claude models through Anthropic Messages, so RB_MODEL_API must be anthropic");
+    const round = integer(env, "RB_SHAPE_ROUND", 1, 1, 10_000);
+    shape = {
+      solBaseUrl: required(env, "RB_SOL_BASE_URL").replace(/\/+$/, ""),
+      outDir: env.RB_SHAPE_OUT?.trim() || join(dirname(outPath), "shape"),
+      keptDir: env.RB_SHAPE_KEPT?.trim() || null,
+      round,
+      roundOf: env.RB_SHAPE_ROUND_OF?.trim() || null,
+      // In a later round RB_BASE is an earlier head of the pull request, whose rule files the pull request wrote.
+      rulesBase: env.RB_SHAPE_RULES_BASE?.trim() || env.RB_SHAPE_ROUND_OF?.trim() ? sha(env, "RB_SHAPE_RULES_BASE") : sha(env, "RB_BASE"),
+      label: `re-${nwo.replace("/", ".")}-${prNumber}-${round}`,
+    };
+  }
 
   return {
-    nwo: required(env, "RB_NWO"),
+    nwo,
     prNumber,
     base: sha(env, "RB_BASE"),
     head: sha(env, "RB_HEAD"),
@@ -214,6 +260,7 @@ export function loadConfig(env: Env): Config {
     retryEmpty: retryEmpty === "on",
     naive: naive === "on",
     swarm: swarm === "on",
+    shape,
     minSeverity,
     fitModel: env.RB_CONFIG_FIT?.trim() || null,
     fitOutPath: join(dirname(outPath), "fit.json"),
@@ -230,6 +277,7 @@ export function loadConfig(env: Env): Config {
 /** The settings line the benchmark looks for: every configured label value must appear in the output. */
 export function describeSettings(config: Config): string {
   if (config.naive) return `naive=on model=${config.models[0]} max_findings=${config.maxFindings} time_budget=${config.budgetMs / 1000}`;
+  if (config.shape) return `shape=on model=${config.models[0]} label=${config.shape.label} rules_base=${config.shape.rulesBase.slice(0, 12)}${config.shape.keptDir ? " kept=on" : ""}`;
   if (config.swarm) return `swarm=on model=${config.models[0]} verifier=${config.verifierModel} verify=${config.verify} effort=${config.effort ?? "default"} max_findings=${config.maxFindings} time_budget=${config.budgetMs / 1000} max_turns=${config.maxTurns}`;
   return [
     `model=${config.models.map((model, index) => (config.focuses[index] ? `${model}@${config.focuses[index]}` : model)).join(",")}`,

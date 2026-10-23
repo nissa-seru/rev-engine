@@ -131,3 +131,12 @@ test("reads the endpoint from the environment where it is set and not empty, and
   assert.equal(readEndpoint(dir, { RB_MODEL_API_KEY: "  " }).apiKey, "from-file");
   assert.equal(readEndpoint(join(dir, "missing"), { OPENROUTER_API_KEY: "shell" }).apiKey, "shell");
 });
+
+test("the review shape reads project rules from the pull request's base, which a later round must name", () => {
+  const shape = { ...BASE, RB_MODEL_API: "anthropic", RB_MODEL_BASE_URL: "http://127.0.0.1:9/anthropic", RB_CONFIG_SHAPE: "on", RB_SOL_BASE_URL: "http://127.0.0.1:6175/openai/" };
+  const first = loadConfig(shape).shape!;
+  assert.equal(first.rulesBase, BASE.RB_BASE, "a first round reads them from its own base");
+  assert.equal(first.solBaseUrl, "http://127.0.0.1:6175/openai");
+  assert.equal(loadConfig({ ...shape, RB_SHAPE_RULES_BASE: "c".repeat(40) }).shape!.rulesBase, "c".repeat(40));
+  assert.throws(() => loadConfig({ ...shape, RB_SHAPE_ROUND: "2", RB_SHAPE_ROUND_OF: "re-owner.repo-1938-1" }), /RB_SHAPE_RULES_BASE/, "a later round's base is an earlier head of the pull request");
+});

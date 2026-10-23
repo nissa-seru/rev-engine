@@ -3,7 +3,7 @@
 //
 // Using a tool for the final answer works with any model that can call tools,
 // and the arguments are checked as JSON before the loop accepts them.
-import { ModelError, type Chat, type ChatMessage } from "./llm.ts";
+import { ModelError, ModelRefused, ModelUnavailable, type Chat, type ChatMessage } from "./llm.ts";
 import { readTools, type ToolDefinition, type Workspace } from "./tools.ts";
 
 /**
@@ -13,6 +13,8 @@ import { readTools, type ToolDefinition, type Workspace } from "./tools.ts";
 const WRAP_UP_MS = 100_000;
 /** Conversation size, in characters, past which the model is told to submit. Bounds the cost of every later turn. */
 const MAX_CONTEXT_CHARS = 800_000;
+/** Characters per token, low, for a conversation whose replies don't report their size against a token bound. */
+const CHARS_PER_TOKEN = 3;
 
 /**
  * Requests to look again after the first submission, one per round, and how to join
@@ -29,6 +31,8 @@ export interface AgentOptions {
   system: string;
   prompt: string;
   workspace: Workspace;
+  /** The tools offered beside the submit tool: the read tools when left out, [] for a call that only answers. */
+  tools?: ToolDefinition[];
   submit: ToolDefinition;
   /** Epoch milliseconds by which the submission must be in. */
   deadline: number;
@@ -37,10 +41,34 @@ export interface AgentOptions {
   secondLook?: SecondLook;
   /** Names this run in the usage totals and the log, such as "s1" or "verifier". */
   caller?: string;
+  /** Reasoning effort for every call of this run, in place of the client's. */
+  effort?: string;
+  /**
+   * The context size, in tokens as the client reports each reply's, at which the model is made to hand in what it has.
+   * When set, it takes the place of the character bound.
+   */
+  contextBound?: number;
+  /** Set when the run handed in because it reached contextBound. */
+  report?: { bounded: boolean };
+  /** One id for every call of this run, so a gateway keeps the run's prompt cache together. */
+  conversation?: string;
+  /** The context, in tokens, that the model is shown counting down on every call (Anthropic Messages' task budget). */
+  taskBudget?: number;
+  /**
+   * What a turn that fails after the client's retries does: ask for the submission (the default), or end the run with
+   * the error, for a review that keeps its answers and asks again later rather than take a partial one.
+   */
+  onFailedTurn?: "submit" | "throw";
   /** Cuts off one model call sooner than the client's default, so a stalled call is retried sooner. */
   attemptTimeoutMs?: number;
   /** Time kept back for the submission, when a short deadline needs less than WRAP_UP_MS. */
   wrapUpMs?: number;
+  /**
+   * Requests a model may take once it has been asked to hand in, reading nothing more, before the run ends without
+   * its submission. A model that thinks can't be forced to the submit tool on every API, so with no other limit it
+   * could read on past its bound. Left out, as the reader leaves it (as on main): reads are still answered, and maxTurns ends the run.
+   */
+  handInTurns?: number;
   log: (message: string) => void;
 }
 
@@ -120,6 +148,9 @@ export async function runAgent(options: AgentOptions): Promise<Record<string, un
   try {
     return await loop(options, held);
   } catch (error) {
+    // A run that ends with its error keeps nothing partial: the review asks it again later, whole. A refusal or a
+    // model that can't be reached stops the review whatever was held, as the loop rethrows them.
+    if (options.onFailedTurn === "throw" || error instanceof ModelRefused || error instanceof ModelUnavailable) throw error;
     if (held.submissions.length && options.secondLook) {
       options.log(`${options.caller ?? options.model}: second look failed, keeping the submissions so far: ${describe(error)}`);
       return options.secondLook.combine(held.partial ? [...held.submissions, held.partial] : held.submissions);
@@ -137,13 +168,16 @@ async function loop(options: AgentOptions, held: Held): Promise<Record<string, u
   const wrapUpMs = options.wrapUpMs ?? WRAP_UP_MS;
   const started = Date.now();
   const submitName = submit.function.name;
-  const tools = [...readTools, submit];
+  const tools = [...(options.tools ?? readTools), submit];
   const messages: ChatMessage[] = [
     { role: "system", content: options.system },
     { role: "user", content: options.prompt },
   ];
   let wrappingUp = false;
   let forcedChoiceWorks = true;
+  /** The context size of the reply that passed contextBound, or 0 while none has. */
+  let pastBound = 0;
+  let wrapUpTurns = 0;
   let contextChars = options.system.length + options.prompt.length;
   const push = (message: ChatMessage): void => {
     messages.push(message);
@@ -157,24 +191,36 @@ async function loop(options: AgentOptions, held: Held): Promise<Record<string, u
   for (let turn = 1; turn <= maxTurns; turn += 1) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error(`${model} ran out of time before submitting`);
-    if (!wrappingUp && (turn === maxTurns || remaining <= wrapUpMs || contextChars > MAX_CONTEXT_CHARS)) wrapUp();
+    if (!wrappingUp && pastBound) {
+      if (options.report) options.report.bounded = true;
+      log(`${who}: its context reached ${pastBound} tokens, past its bound of ${options.contextBound}; asking for the submission`);
+    }
+    if (!wrappingUp && (turn === maxTurns || remaining <= wrapUpMs || pastBound || (!options.contextBound && contextChars > MAX_CONTEXT_CHARS))) wrapUp();
+    // Every request made once the ask is in counts, the one that carries it included, whichever way the ask came.
+    if (wrappingUp && options.handInTurns && ++wrapUpTurns > options.handInTurns) throw new Error(`${model} did not submit in the ${options.handInTurns} turns after it was asked to`);
 
     // An ordinary turn must leave the wrap-up window untouched; the wrap-up turn gets all that is left.
     const request = {
       model, messages, tools, timeoutMs: wrappingUp ? remaining : remaining - wrapUpMs,
       ...(options.caller ? { caller: options.caller } : {}),
+      ...(options.effort ? { effort: options.effort } : {}),
+      ...(options.conversation ? { conversation: options.conversation } : {}),
+      ...(options.taskBudget ? { taskBudget: options.taskBudget } : {}),
       ...(options.attemptTimeoutMs ? { attemptTimeoutMs: options.attemptTimeoutMs } : {}),
     };
     let reply: ChatMessage;
     try {
       reply = await chat(wrappingUp && forcedChoiceWorks ? { ...request, forceTool: submitName } : request);
     } catch (error) {
+      // A refusal would be refused again, and a model that can't be reached won't answer a request for the
+      // submission either, so both end the run at once.
+      if (error instanceof ModelRefused || error instanceof ModelUnavailable) throw error;
       const rejected = error instanceof ModelError && error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429;
       if (wrappingUp && forcedChoiceWorks && rejected) {
-        // Not every provider accepts a forced tool choice. Ask again and let the model choose.
+        // Not every provider accepts a forced tool choice. Ask again and let the model choose, in the time left now.
         forcedChoiceWorks = false;
-        reply = await chat(request);
-      } else if (!wrappingUp && !rejected && deadline - Date.now() > 10_000) {
+        reply = await chat({ ...request, timeoutMs: Math.max(1, deadline - Date.now()) });
+      } else if (!wrappingUp && !rejected && options.onFailedTurn !== "throw" && deadline - Date.now() > 10_000) {
         // A slow or failing call used up the investigation time. Ask for the submission instead of giving up.
         log(`${who}: turn ${turn} failed (${describe(error)}); asking for the submission`);
         wrapUp();
@@ -184,6 +230,11 @@ async function loop(options: AgentOptions, held: Held): Promise<Record<string, u
       }
     }
     push(reply);
+    // A run past its bound is made to hand in what it has at the next turn, once this turn's tool calls have their
+    // results (the workflow this ports would fold its worker and carry on).
+    // A reply that reports no usage is measured by its conversation's characters, low per token, so the bound holds anyway.
+    const size = reply.contextTokens ?? Math.ceil(contextChars / CHARS_PER_TOKEN);
+    if (options.contextBound && size >= options.contextBound) pastBound = size;
 
     const calls = reply.tool_calls ?? [];
     const elapsed = Math.round((Date.now() - started) / 1000);
@@ -217,7 +268,14 @@ async function loop(options: AgentOptions, held: Held): Promise<Record<string, u
     }
 
     for (const call of calls) {
-      push({ role: "tool", tool_call_id: call.id, content: await workspace.call(call.function.name, call.function.arguments) });
+      const offered = tools.some((tool) => tool.function.name === call.function.name);
+      if (!offered) log(`${who}: called ${call.function.name.slice(0, 80)}, which it wasn't offered`);
+      // Once asked to hand in, a run with handInTurns reads nothing more (see handInTurns).
+      if (wrappingUp && options.handInTurns) {
+        push({ role: "tool", tool_call_id: call.id, content: JSON.stringify({ ok: false, error: `reading has stopped; call ${submitName} now with what you have` }) });
+        continue;
+      }
+      push({ role: "tool", tool_call_id: call.id, content: offered ? await workspace.call(call.function.name, call.function.arguments) : JSON.stringify({ ok: false, error: "unknown tool" }) });
     }
   }
   throw new Error(`${model} did not submit within ${maxTurns} turns`);
