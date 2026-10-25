@@ -184,7 +184,8 @@ function knownNote(issue: PostedIssue): string {
   if (issue.knownAt === "description") {
     // Only the change's own blockers and should-fix issues weigh, so only they can be said to weigh still.
     if (namedLimit(issue)) return "Named in this pull request's description or commit messages, with a reason for leaving it that holds by reading, so it doesn't weigh in the recommendation.";
-    if (issue.origin === "change" && issue.severity !== "minor") return "Named in this pull request's description or commit messages, and it still weighs in the recommendation: by reading, nothing there gives a reason for leaving it that holds.";
+    // Said only where the judge answered: a review saved before it did says only where the issue is named.
+    if (issue.origin === "change" && issue.severity !== "minor" && issue.reasonHolds === false) return "Named in this pull request's description or commit messages, and it still weighs in the recommendation: by reading, nothing there gives a reason for leaving it that holds.";
     return "Named in this pull request's description or commit messages.";
   }
   const number = /\/issues\/(\d+)$/.exec(issue.knownAt)?.[1];
@@ -288,7 +289,9 @@ export function shapeRecommendation(review: Pick<ShapeReview, "issues" | "unjudg
   const blockers = real.filter((issue) => issue.severity === "blocker").length;
   const shouldFix = real.filter((issue) => issue.severity === "should-fix").length;
   const unsettled = own.filter((issue) => issue.verdict === "unsure" && issue.severity !== "minor").length;
+  const named = review.issues.filter((issue) => namedLimit(issue) && issue.severity !== "minor").length;
   const also: string[] = [];
+  if (named) also.push(`${count(named, "more blocker or should-fix issue")} the description or commit messages name, with a reason for leaving ${named === 1 ? "it" : "them"} that holds, ${named === 1 ? "is" : "are"} listed apart and ${named === 1 ? "doesn't" : "don't"} weigh here.`);
   if (unsettled) also.push(`${count(unsettled, "more blocker or should-fix issue")} the judge couldn't settle ${unsettled === 1 ? "is" : "are"} listed for a maintainer to weigh.`);
   if (review.unjudged.length) also.push(`${count(review.unjudged.length, "issue")} the judge gave no verdict on ${review.unjudged.length === 1 ? "isn't" : "aren't"} weighed here.`);
   if (review.roundOf) also.push(`It covers only what changed since ${review.base.slice(0, 7)}, the commit an earlier review read; that review's issues stand as it gave them.`);
@@ -296,7 +299,7 @@ export function shapeRecommendation(review: Pick<ShapeReview, "issues" | "unjudg
   const filed = `fixed in this pull request or filed as an issue before merging`;
   if (blockers) return `**Recommendation: fix, then merge.** ${count(blockers, "blocker")} should be fixed first${shouldFix ? `, and ${count(shouldFix, "should-fix issue")} ${filed}` : ""}.${tail}`;
   if (shouldFix) return `**Recommendation: fix here or file an issue for each, then merge.** ${count(shouldFix, "should-fix issue")} should be ${filed}.${tail}`;
-  return `**Recommendation: merge.** The review found no blocker or should-fix issue in the change that its judge held real.${tail}`;
+  return `**Recommendation: merge.** The review found no ${named ? "other " : ""}blocker or should-fix issue in the change that its judge held real.${tail}`;
 }
 
 /** A Finding for the comment helpers shared with the other review: one of its places, its level and words. */

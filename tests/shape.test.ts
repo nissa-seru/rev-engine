@@ -878,7 +878,7 @@ test("an issue's text and its run end with one full stop, a minor issue has no r
   assert.match(stopped, /\*\*Blocker\. Issue I1\.\*\*\n\nIt fails at src\/a\.ts:11\.\n\nTo confirm: run the case\.\n\n<!--/);
   const minor = shapeCommentBody({ ...posted("I2", "minor"), confirm: "a run nobody needs" });
   assert.doesNotMatch(minor, /To confirm/, "a minor issue isn't a lead for a run");
-  const unsure = shapeCommentBody({ ...posted("I3", "should-fix"), verdict: "unsure", knownAt: "description" });
+  const unsure = shapeCommentBody({ ...posted("I3", "should-fix"), verdict: "unsure", knownAt: "description", reasonHolds: false });
   assert.match(unsure, /The judge couldn't settle it from the code, so it is listed for a maintainer to weigh\.\n\nNamed in this pull request's description or commit messages, and it still weighs in the recommendation: by reading, nothing there gives a reason for leaving it that holds\./);
   assert.equal(clause(["why it fails?"]), "why it fails?", "a question keeps its own mark");
   assert.equal(clause(["a,", "b:"]), "a; b.");
@@ -1128,7 +1128,7 @@ test("a limit the change's own text names weighs in the advice only when no reas
   assert.deepEqual([named!.reasonHolds, linked!.reasonHolds], [true, false]);
   const left = { ...posted("I1", "should-fix"), knownAt: "description", reasonHolds: true };
   const weighs = { ...posted("I1", "should-fix"), knownAt: "description", reasonHolds: false };
-  assert.match(shapeRecommendation({ issues: [left], unjudged: [], roundOf: null, base: "b".repeat(40) }), /^\*\*Recommendation: merge\.\*\*/, "a named limit whose reason holds is the author's call");
+  assert.equal(shapeRecommendation({ issues: [left], unjudged: [], roundOf: null, base: "b".repeat(40) }), "**Recommendation: merge.** The review found no other blocker or should-fix issue in the change that its judge held real. 1 more blocker or should-fix issue the description or commit messages name, with a reason for leaving it that holds, is listed apart and doesn't weigh here.", "a named limit whose reason holds is the author's call, and the advice says it's there");
   assert.match(shapeRecommendation({ issues: [weighs], unjudged: [], roundOf: null, base: "b".repeat(40) }), /^\*\*Recommendation: fix here or file an issue for each, then merge\.\*\* 1 should-fix issue/, "one with no reason that holds still weighs");
   assert.match(shapeRecommendation({ issues: [left, { ...posted("I2", "should-fix") }], unjudged: [], roundOf: null, base: "b".repeat(40) }), / 1 should-fix issue should be/, "and only the other counts");
   const body = buildShapeReview({ review: shapeReview([left]), hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 10 }).body;
@@ -1136,6 +1136,8 @@ test("a limit the change's own text names weighs in the advice only when no reas
   assert.match(body, /#### Named in this pull request \(1\)\n\n<details>\n<summary>1 issue the description or commit messages name, with a reason for leaving it that holds by reading, which doesn't weigh in the recommendation<\/summary>/, "listed apart, as information");
   assert.doesNotMatch(body, /#### Should fix/, "not among the should-fix issues the advice counts");
   assert.match(shapeCommentBody({ ...posted("I3", "minor"), knownAt: "description" }), /\n\nNamed in this pull request's description or commit messages\.\n/, "a minor issue, which never weighs, isn't said to weigh still");
+  const { reasonHolds: _, ...unanswered } = { ...posted("I5", "should-fix"), knownAt: "description" };
+  assert.match(shapeCommentBody(unanswered), /\n\nNamed in this pull request's description or commit messages\.\n/, "nor is one from a review saved before the judge answered");
   assert.match(shapeCommentBody({ ...posted("I4", "should-fix"), origin: "base", knownAt: "description", reasonHolds: true }), /\n\nNamed in this pull request's description or commit messages\.\n/, "nor is existing code's");
   assert.match(body, /Besides those this pull request names itself, below, the review found no issue in the change/);
 });
