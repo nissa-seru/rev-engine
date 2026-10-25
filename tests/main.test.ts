@@ -11,7 +11,7 @@ const DIFF = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n
 
 type Answer = (body: string, n: number) => { status: number; json: unknown; delayMs?: number };
 const REFUSED = { status: 400, json: { type: "error", error: { type: "invalid_request_error", message: "PROVIDER-WORDS quoting src/held.ts" } } };
-const message = (content: unknown[], stop: string) => ({ status: 200, json: { id: "msg_1", type: "message", role: "assistant", model: "m", content, stop_reason: stop, usage: { input_tokens: 10, output_tokens: 5 } } });
+const message = (content: unknown[], stop: string) => ({ status: 200, json: { id: "msg_1", type: "message", role: "assistant", model: "m", content, stop_reason: stop, usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 3 } } });
 /** Its first request answered with text, so a turn and its usage are recorded, and every later one refused as malformed (400). */
 const TEXT_THEN_REFUSED: Answer = (_, n) => (n === 1 ? message([{ type: "text", text: "MODEL-TEXT about src/held.ts" }], "end_turn") : REFUSED);
 const NOTHING_FOUND = { findings: [], unread: [], note: "MODEL-TEXT about src/held.ts" };
@@ -88,6 +88,13 @@ test("the review shape's job log says only that it started and how it ended; eve
   assert.ok(lines.some((line) => line.startsWith("usage ")), "the usage of each caller");
   assert.ok(lines.some((line) => line.startsWith("review stopped (failed): ")), "the stop as the review records it");
   assert.doesNotMatch(stderr + trace.join("\n"), /PROVIDER-WORDS|MODEL-TEXT/, "a provider's words and the model's text reach neither");
+  const record = JSON.parse(readFileSync(join(root, "out", "shape", "run.json"), "utf8")) as { usage: Record<string, { calls: number }>; usageByModel: Record<string, { calls: number; cacheWriteTokens: number }> };
+  const calls = (spent: Record<string, { calls: number }>) => Object.values(spent).reduce((sum, one) => sum + one.calls, 0);
+  assert.ok(Object.keys(record.usageByModel).length > 0, "the run's record gives its usage by model");
+  assert.equal(calls(record.usageByModel), calls(record.usage), "every call counted under its model, as under its caller");
+  for (const [model, spent] of Object.entries(record.usageByModel)) {
+    assert.equal(spent.cacheWriteTokens, model === "gpt-6.1-sol" ? 0 : 3 * spent.calls, `${model}'s cache writes, apart, summed over its calls`);
+  }
 });
 
 test("the reader's lines all go to the job's log, and it writes no trace", { timeout: 120_000 }, async () => {

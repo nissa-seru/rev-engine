@@ -326,6 +326,8 @@ test("the off label skips a review nobody asked for by comment, and keeps one fr
   assert.match(skipped.stdout, /::notice::No review: pull request 7 carries the label no-automated-review; comment \/review on it to review it/);
   assert.equal(ask("workflow_dispatch", ["no-automated-review"], { INPUT_NUMBER: "7" }).outputs.run, "false", "a dispatched run, such as a resume, is skipped too");
   assert.equal(ask("issue_comment", ["no-automated-review"]).outputs.run, "true", "a comment asking for a review still has it");
+  assert.equal(ask("issue_comment", ["bug"], { COMMAND: "/review deep", COMMENT: "/review deep\r\nThe auth part, please." }).outputs.run, "true", "a command with a note on the next line asks too");
+  assert.equal(ask("issue_comment", ["bug"], { COMMAND: "/review deep", COMMENT: "/review deeper" }).outputs.run, "false", "but not a longer word");
   assert.equal(ask("pull_request_target", ["bug"]).outputs.run, "true");
   assert.equal(ask("pull_request_target", ["no-automated-review"], { OFF_LABEL: "" }).outputs.run, "true", "an empty off-label turns nothing off");
   // The shape saves its run only sealed with the model key, so it doesn't start without one.
@@ -445,6 +447,9 @@ test("each value a step reads is bound from the input or variable it stands for"
   const bound = (step: string, line: string, source = ACTION) => assert.ok(stepBlock(step, source).split("\n").some((each) => each.trim() === line), `${step}: ${line}`);
   bound("Check who asked", "OFF_LABEL: ${{ inputs.off-label }}");
   bound("Check who asked", "MODEL_API_KEY: ${{ inputs.model-api-key }}");
+  bound("Check who asked", "COMMENT: ${{ github.event.comment.body }}", WORKFLOW);
+  bound("Check who asked", "DEFAULT_PIPELINE: ${{ vars.REVIEW_PIPELINE }}", WORKFLOW);
+  bound("Post the review", "DEEP_COMMAND: ${{ inputs.deep-command }}");
   bound("Post the review", "OFF_LABEL: ${{ inputs.off-label }}");
   bound("Say that the review stopped", "OFF_LABEL: ${{ inputs.off-label }}");
   bound("Say that the review stopped", "EVENT_NAME: ${{ github.event_name }}");
@@ -482,4 +487,43 @@ test("each value a step reads is bound from the input or variable it stands for"
   assert.ok(at("Save the review shape's run") < at("Say that the review stopped") && at("Say that the review stopped") < at("Post the review") && at("Post the review") < at("Seal it again with its comments"));
   bound("Review", "model-api-key: ${{ secrets.MODEL_API_KEY }}", WORKFLOW);
   assert.match(ACTION, /\n  off-label:\n    description: [^\n]+\n    default: no-automated-review\n/);
+});
+
+test("the shared workflow reviews a write-access /review deep comment with the shape, and every other review with the repository's default", () => {
+  const deep = /^  DEEP_COMMAND: (.+)$/m.exec(WORKFLOW)?.[1];
+  const plain = /^  REVIEW_COMMAND: (.+)$/m.exec(WORKFLOW)?.[1];
+  assert.equal(deep, "/review deep");
+  assert.equal(plain, "/review");
+  const ask = (event: string, comment: string, defaultPipeline = "", permission = "write", commands = { REVIEW_COMMAND: plain!, DEEP_COMMAND: deep! }) => runStep("Check who asked", {
+    EVENT_NAME: event, COMMENT: comment, DEFAULT_PIPELINE: defaultPipeline, ...commands, REPO: "o/r", ACTOR: "someone", GH_TOKEN: "t",
+  }, (temp) => stub(temp, "gh", `echo ${permission}`), { source: WORKFLOW }).outputs;
+  assert.deepEqual(ask("issue_comment", "/review deep"), { pipeline: "shape", command: "/review deep", allowed: "true" });
+  assert.deepEqual(ask("issue_comment", "/review deep please, the auth part"), { pipeline: "shape", command: "/review deep", allowed: "true" });
+  assert.deepEqual(ask("issue_comment", "/review deep\r\nThe auth part, please."), { pipeline: "shape", command: "/review deep", allowed: "true" }, "a note on the next line, as GitHub's editor sends it");
+  assert.deepEqual(ask("issue_comment", "/review"), { pipeline: "reader", command: "/review", allowed: "true" });
+  assert.deepEqual(ask("issue_comment", "/review deeper"), { pipeline: "reader", command: "/review", allowed: "true" }, "only the word itself");
+  assert.deepEqual(ask("issue_comment", "/review\r\nThe auth part, please."), { pipeline: "reader", command: "/review", allowed: "true" }, "a line break after the command, as after the deep one");
+  assert.deepEqual(ask("issue_comment", "/reviewer, could you look?"), {}, "a comment that only begins like the command asks for nothing");
+  assert.match(failedOutput(() => ask("issue_comment", "/review deep", "", "write", { REVIEW_COMMAND: plain!, DEEP_COMMAND: "" })), /::error::The workflow's REVIEW_COMMAND or DEEP_COMMAND is empty/, "an empty command fails rather than taking a deep request as the reader's");
+  assert.deepEqual(ask("issue_comment", "/review the deep parts"), { pipeline: "reader", command: "/review", allowed: "true" });
+  assert.deepEqual(ask("issue_comment", "/review", "shape"), { pipeline: "shape", command: "/review", allowed: "true" }, "where the shape is the default");
+  assert.deepEqual(ask("pull_request_target", ""), { pipeline: "reader", command: "/review", allowed: "true" });
+  assert.deepEqual(ask("pull_request_target", "", "shape"), { pipeline: "shape", command: "/review", allowed: "true" });
+  assert.deepEqual(ask("workflow_dispatch", ""), { pipeline: "reader", command: "/review", allowed: "true" }, "a manual run is the default's");
+  assert.equal(ask("issue_comment", "/review deep", "", "read").allowed, undefined, "and asks write access, as /review does");
+  assert.equal(ask("issue_comment", "/review deep", "", "triage").allowed, undefined);
+});
+
+test("what follows the review's pipeline in the shared workflow reads the who job's choice, not the repository's default", () => {
+  const readers = WORKFLOW.split("\n").filter((line) => line.includes("vars.REVIEW_PIPELINE"));
+  assert.deepEqual(readers.map((line) => line.trim()), ["DEFAULT_PIPELINE: ${{ vars.REVIEW_PIPELINE }}"], "so a deep run gets the shape's dependencies, time limit and head wherever it runs");
+});
+
+test("the reader's review is posted from a container that's given the deep command, so the review can name it", () => {
+  const head = "c".repeat(40);
+  const posted = runStep("Post the review", {
+    GITHUB_TOKEN: "t", RB_NWO: "o/r", RB_PR_NUMBER: "7", RB_HEAD: head, SHAPE: "", EVENT_NAME: "issue_comment", OFF_LABEL: "", COMMAND: "/review", DEEP_COMMAND: "/review deep", GITHUB_ACTION_PATH: "/action",
+  }, (temp) => stub(temp, "docker", `printf '%s\\n' "$@" > "${join(temp, "docker-args")}"`));
+  const args = readFileSync(join(posted.temp, "docker-args"), "utf8").split("\n");
+  assert.ok(args.some((arg, index) => arg === "-e" && args[index + 1] === "DEEP_COMMAND"), args.join(" "));
 });

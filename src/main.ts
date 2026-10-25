@@ -68,6 +68,7 @@ try {
 const started = Date.now();
 const usage = emptyUsage();
 const usageByCaller = new Map<string, Usage>();
+const usageByModel = new Map<string, Usage>();
 if (config.shape) log = traceTo(join(config.shape.outDir, "trace.log"));
 both(`reviewing ${config.nwo}#${config.prNumber} at ${config.head.slice(0, 12)}`);
 both(`settings: ${describeSettings(config)}`);
@@ -111,7 +112,7 @@ async function writeTranscripts(): Promise<void> {
 }
 
 try {
-  const send = createChat({ apiKey: config.apiKey, baseUrl: config.baseUrl, api: config.api, headers: config.headers, effort: config.effort, usage, usageByCaller });
+  const send = createChat({ apiKey: config.apiKey, baseUrl: config.baseUrl, api: config.api, headers: config.headers, effort: config.effort, usage, usageByCaller, usageByModel });
   const chat: Chat = config.transcriptOutPath
     ? (request) => {
       transcripts.set(request.caller ?? request.model, { model: request.model, messages: request.messages });
@@ -120,9 +121,9 @@ try {
     : send;
   if (config.shape) {
     // The review shape asks Sol through Responses, with the same key and gateway headers as the Claude endpoint.
-    const sol = createChat({ apiKey: config.apiKey, baseUrl: config.shape.solBaseUrl, api: "responses", headers: config.headers, effort: null, usage, usageByCaller });
+    const sol = createChat({ apiKey: config.apiKey, baseUrl: config.shape.solBaseUrl, api: "responses", headers: config.headers, effort: null, usage, usageByCaller, usageByModel });
     const outcome = await shapeReview({
-      config, claude: chat, sol, usageByCaller, log,
+      config, claude: chat, sol, usageByCaller, usageByModel, log,
       run: { outDir: config.shape.outDir, keptDir: config.shape.keptDir, label: config.shape.label, round: config.shape.round, roundOf: config.shape.roundOf },
     });
     logUsageByCaller();

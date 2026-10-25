@@ -179,3 +179,12 @@ test("the fit section keeps two sentences of the summary in view and collapses t
   const bare = buildReview({ ...base, findings: [], fit: { verdict: "fits", summary: "A bug fix. It fits.", reasons: [] } });
   assert.doesNotMatch(bare.body, /<details>/);
 });
+
+test("the review ends by naming the comment that asks for a deeper review, where the workflow offers one", () => {
+  const line = "For a deeper review by several readers and a judge, which takes longer, a maintainer can comment `/review deep`.";
+  for (const findings of [[], [finding("src/a.ts", 42, 42, "high")]]) {
+    const body = buildReview({ ...base, findings, deepCommand: "/review deep" }).body;
+    assert.ok(body.endsWith(`${line}\n\n${MARKER}`), body);
+    assert.ok(!buildReview({ ...base, findings }).body.includes("deeper review"), "without a deep command, no such line");
+  }
+});

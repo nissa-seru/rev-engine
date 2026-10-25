@@ -70,13 +70,15 @@ export interface Usage {
   promptTokens: number;
   completionTokens: number;
   cachedTokens: number;
+  /** Of the prompt tokens, those written to the provider's cache, where the API reports them apart. */
+  cacheWriteTokens: number;
   /** Of the completion tokens, those the model reasoned with, where the API reports them. */
   reasoningTokens: number;
   costUsd: number;
 }
 
 export function emptyUsage(): Usage {
-  return { calls: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, reasoningTokens: 0, costUsd: 0 };
+  return { calls: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, costUsd: 0 };
 }
 
 export class ModelError extends Error {
@@ -181,6 +183,8 @@ export interface ClientOptions {
   usage: Usage;
   /** Filled with the usage of each caller that names itself in its requests. */
   usageByCaller?: Map<string, Usage>;
+  /** Filled with the usage of each model the requests name. */
+  usageByModel?: Map<string, Usage>;
   /** In place of fetch; tests pass one. The Responses API's default is longFetch, below. */
   fetchImpl?: typeof fetch;
 }
@@ -211,11 +215,16 @@ export function createChat(options: ClientOptions): Chat {
       if (!options.usageByCaller.has(request.caller)) options.usageByCaller.set(request.caller, emptyUsage());
       totals.push(options.usageByCaller.get(request.caller)!);
     }
+    if (options.usageByModel) {
+      if (!options.usageByModel.has(request.model)) options.usageByModel.set(request.model, emptyUsage());
+      totals.push(options.usageByModel.get(request.model)!);
+    }
     for (const usage of totals) {
       usage.calls += 1;
       usage.promptTokens += add.promptTokens;
       usage.completionTokens += add.completionTokens;
       usage.cachedTokens += add.cachedTokens;
+      usage.cacheWriteTokens += add.cacheWriteTokens;
       usage.reasoningTokens += add.reasoningTokens;
       usage.costUsd += add.costUsd;
     }
@@ -258,6 +267,7 @@ export function createChat(options: ClientOptions): Chat {
       promptTokens,
       completionTokens,
       cachedTokens: Number(payload.usage?.prompt_tokens_details?.cached_tokens) || 0,
+      cacheWriteTokens: 0,
       reasoningTokens: Number(payload.usage?.completion_tokens_details?.reasoning_tokens) || 0,
       costUsd: Number(payload.usage?.cost) || 0,
     });
@@ -314,12 +324,14 @@ export function createChat(options: ClientOptions): Chat {
 
     const usage = payload.usage ?? {};
     const cacheRead = Number(usage.cache_read_input_tokens) || 0;
-    const promptTokens = (Number(usage.input_tokens) || 0) + cacheRead + (Number(usage.cache_creation_input_tokens) || 0);
+    const cacheWrite = Number(usage.cache_creation_input_tokens) || 0;
+    const promptTokens = (Number(usage.input_tokens) || 0) + cacheRead + cacheWrite;
     const completionTokens = Number(usage.output_tokens) || 0;
     count(request, {
       promptTokens,
       completionTokens,
       cachedTokens: cacheRead,
+      cacheWriteTokens: cacheWrite,
       // The Messages API doesn't count thinking apart from the rest of the output.
       reasoningTokens: 0,
       // The Messages API reports tokens, not money.
@@ -400,6 +412,7 @@ export function createChat(options: ClientOptions): Chat {
       promptTokens,
       completionTokens,
       cachedTokens: Number(usage.input_tokens_details?.cached_tokens) || 0,
+      cacheWriteTokens: 0,
       reasoningTokens: Number(usage.output_tokens_details?.reasoning_tokens) || 0,
       costUsd: 0,
     });

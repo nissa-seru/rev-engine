@@ -1,7 +1,8 @@
 # One review workflow for many repositories, each of which calls it from a short workflow of its
 # own, such as this repository's review.yml. It reviews every pull request when it's opened,
 # reopened or marked ready, whoever its author, unless the caller turns at-open off, and again
-# whenever a person with write access comments /review.
+# whenever a person with write access comments /review. Such a person's comment of /review deep
+# reviews it with the review shape instead, whatever the repository's default.
 #
 # The runner joins a private tailnet for the length of the job, as an ephemeral device tagged
 # tag:ci, through Tailscale's workload identity federation, and reviews through a model
@@ -17,18 +18,23 @@
 #
 # The caller's repository or organization provides variables TS_CLIENT_ID and TS_AUDIENCE
 # (the federated identity), MODEL_HOST (the endpoint's tailnet address, which the join waits
-# to reach) and MODEL_BASE_URL (the endpoint's base URL for Anthropic Messages), and the
-# secret MODEL_API_KEY.
+# to reach), MODEL_BASE_URL (the endpoint's base URL for Anthropic Messages) and SOL_BASE_URL
+# (its base URL for OpenAI Responses, which the shape needs, so any /review deep), and the
+# secret MODEL_API_KEY, whose grant must reach both.
 #
-# With the variable REVIEW_PIPELINE set to "shape", the review is the review shape (src/shape),
-# which also needs SOL_BASE_URL (the endpoint's base URL for OpenAI Responses), seals the run it
-# saves with MODEL_API_KEY (since anyone signed in to GitHub can download a public repository's
-# artifacts, and the run holds what the review doesn't post), reads the repository's
-# open issues when the caller's permissions grant issues: read, may take up to
-# the job's six hours, and reads the head's dependencies, installed by a job of their own.
+# With the variable REVIEW_PIPELINE set to "shape", every review is the review shape (src/shape);
+# without it, only a /review deep comment's is, and every other review is RevEngine's own
+# reviewer. The shape seals the run it saves with MODEL_API_KEY (since anyone signed in to GitHub
+# can download a public repository's artifacts, and the run holds what the review doesn't post),
+# reads the repository's open issues when the caller's permissions grant issues: read, may take up
+# to the job's six hours, and reads the head's dependencies, installed by a job of their own.
 # REVIEW_CONSUMERS optionally names public repositories that rely on this one, as owner/name
-# separated by spaces. Without REVIEW_PIPELINE, it is RevEngine's own reviewer, as before.
+# separated by spaces.
 name: RevEngine review
+# A job's if can't read env, so the who job's gate repeats /review, which both commands must begin with.
+env:
+  REVIEW_COMMAND: /review
+  DEEP_COMMAND: /review deep
 on:
   workflow_call:
     inputs:
@@ -51,12 +57,14 @@ jobs:
        inputs.at-open) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
-       (startsWith(github.event.comment.body, '/review ') || github.event.comment.body == '/review')) ||
+       startsWith(github.event.comment.body, '/review')) ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       allowed: ${{ steps.who.outputs.allowed }}
+      pipeline: ${{ steps.who.outputs.pipeline }}
+      command: ${{ steps.who.outputs.command }}
       head: ${{ steps.head.outputs.head }}
     steps:
       # A comment or a manual run asks as a person, who needs write access; the action checks this
@@ -69,7 +77,19 @@ jobs:
           REPO: ${{ github.repository }}
           ACTOR: ${{ github.actor }}
           EVENT_NAME: ${{ github.event_name }}
+          COMMENT: ${{ github.event.comment.body }}
+          DEFAULT_PIPELINE: ${{ vars.REVIEW_PIPELINE }}
         run: |
+          [ -n "$REVIEW_COMMAND" ] && [ -n "$DEEP_COMMAND" ] || { echo "::error::The workflow's REVIEW_COMMAND or DEEP_COMMAND is empty"; exit 1; }
+          pipeline=${DEFAULT_PIPELINE:-reader}; command=$REVIEW_COMMAND
+          if [ "$EVENT_NAME" = issue_comment ]; then
+            case "$COMMENT" in
+              "$DEEP_COMMAND"|"$DEEP_COMMAND"[[:space:]]*) pipeline=shape; command=$DEEP_COMMAND ;;
+              "$REVIEW_COMMAND"|"$REVIEW_COMMAND"[[:space:]]*) ;;
+              *) echo "::notice::No review: the comment is not $REVIEW_COMMAND"; exit 0 ;;
+            esac
+          fi
+          { echo "pipeline=$pipeline"; echo "command=$command"; } >> "$GITHUB_OUTPUT"
           if [ "$EVENT_NAME" = pull_request_target ]; then echo "allowed=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           # A failed lookup fails the run, rather than passing for "no write access".
           permission=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission)
@@ -81,7 +101,7 @@ jobs:
       # The head the dependencies are installed from, for the review shape.
       - name: Find the head
         id: head
-        if: steps.who.outputs.allowed == 'true' && vars.REVIEW_PIPELINE == 'shape'
+        if: steps.who.outputs.allowed == 'true' && steps.who.outputs.pipeline == 'shape'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -100,7 +120,7 @@ jobs:
   # of those, or no package.json leaves the review to read without dependencies.
   dependencies:
     needs: who
-    if: needs.who.outputs.allowed == 'true' && vars.REVIEW_PIPELINE == 'shape'
+    if: needs.who.outputs.allowed == 'true' && needs.who.outputs.pipeline == 'shape'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true
@@ -174,11 +194,10 @@ jobs:
     needs: [who, dependencies]
     if: ${{ !cancelled() && needs.who.outputs.allowed == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ vars.REVIEW_PIPELINE == 'shape' && 360 || 30 }}
-    # Runs for one pull request queue rather than overlap. The comment gate above keeps a stranger's
-    # /review out of the queue, where it would replace a pending review.
+    timeout-minutes: ${{ needs.who.outputs.pipeline == 'shape' && 360 || 30 }}
+    # GitHub replaces a pending run with a newer one in the same group, so each pipeline queues apart.
     concurrency:
-      group: rev-engine-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr-number }}
+      group: rev-engine-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr-number }}-${{ needs.who.outputs.pipeline }}
     steps:
       - name: Join the tailnet
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
@@ -198,7 +217,9 @@ jobs:
           pr-number: ${{ inputs.pr-number }}
           allow-forks: "true"
           authors: any
-          pipeline: ${{ vars.REVIEW_PIPELINE || 'reader' }}
+          pipeline: ${{ needs.who.outputs.pipeline }}
+          command: ${{ needs.who.outputs.command }}
+          deep-command: ${{ env.DEEP_COMMAND }}
           sol-base-url: ${{ vars.SOL_BASE_URL }}
           # Named when the dependencies job passed them on; when it installed nothing or failed, the review reads
           # without them.

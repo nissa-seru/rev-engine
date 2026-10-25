@@ -10,23 +10,27 @@ function replying(usage: Record<string, unknown>): typeof fetch {
   }))) as typeof fetch;
 }
 
-test("totals usage for the run and for each caller that names itself", async () => {
+test("totals usage for the run, for each caller that names itself, and for each model", async () => {
   const usage = emptyUsage();
   const usageByCaller = new Map<string, Usage>();
+  const usageByModel = new Map<string, Usage>();
   const chat = createChat({
-    apiKey: "key", baseUrl: "https://example.test/v1", effort: null, usage, usageByCaller,
+    apiKey: "key", baseUrl: "https://example.test/v1", effort: null, usage, usageByCaller, usageByModel,
     fetchImpl: replying({ prompt_tokens: 100, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 60 }, cost: 0.5 }),
   });
   const request = { model: "test/model", messages: [], tools: [], timeoutMs: 5_000 };
   await chat({ ...request, caller: "s1" });
   await chat({ ...request, caller: "s1" });
-  await chat({ ...request, caller: "verifier" });
+  await chat({ ...request, caller: "verifier", model: "test/other" });
   await chat(request);
 
-  assert.deepEqual(usage, { calls: 4, promptTokens: 400, completionTokens: 40, cachedTokens: 240, reasoningTokens: 0, costUsd: 2 });
-  assert.deepEqual(usageByCaller.get("s1"), { calls: 2, promptTokens: 200, completionTokens: 20, cachedTokens: 120, reasoningTokens: 0, costUsd: 1 });
-  assert.deepEqual(usageByCaller.get("verifier"), { calls: 1, promptTokens: 100, completionTokens: 10, cachedTokens: 60, reasoningTokens: 0, costUsd: 0.5 });
+  assert.deepEqual(usage, { calls: 4, promptTokens: 400, completionTokens: 40, cachedTokens: 240, cacheWriteTokens: 0, reasoningTokens: 0, costUsd: 2 });
+  assert.deepEqual(usageByCaller.get("s1"), { calls: 2, promptTokens: 200, completionTokens: 20, cachedTokens: 120, cacheWriteTokens: 0, reasoningTokens: 0, costUsd: 1 });
+  assert.deepEqual(usageByCaller.get("verifier"), { calls: 1, promptTokens: 100, completionTokens: 10, cachedTokens: 60, cacheWriteTokens: 0, reasoningTokens: 0, costUsd: 0.5 });
   assert.deepEqual([...usageByCaller.keys()], ["s1", "verifier"]);
+  assert.deepEqual(usageByModel.get("test/model"), { calls: 3, promptTokens: 300, completionTokens: 30, cachedTokens: 180, cacheWriteTokens: 0, reasoningTokens: 0, costUsd: 1.5 });
+  assert.deepEqual(usageByModel.get("test/other"), { calls: 1, promptTokens: 100, completionTokens: 10, cachedTokens: 60, cacheWriteTokens: 0, reasoningTokens: 0, costUsd: 0.5 });
+  assert.deepEqual([...usageByModel.keys()].sort(), ["test/model", "test/other"], "every request counts for its model, a caller or not");
 });
 
 test("sends a per-call effort, a reasoning cap in its place, and a provider sort to OpenRouter", async () => {
@@ -57,7 +61,7 @@ test("sends chat completions to <base URL>/chat/completions with the key as a be
   assert.equal(requests[0]!.headers["x-class"], "batch");
 });
 
-test("speaks Anthropic Messages: system, tools, tool results, caching, and the reply as a chat message", async () => {
+test("speaks Anthropic Messages: system, tools, tool results, caching, the reply as a chat message, and its usage with cache reads and cache writes apart", async () => {
   const requests: Array<{ url: string; method: string; headers: Record<string, string>; body: Record<string, any> }> = [];
   const fetchImpl = (async (url: string, init: { method: string; headers: Record<string, string>; body: string }) => {
     requests.push({ url, method: init.method, headers: init.headers, body: JSON.parse(init.body) });
@@ -108,7 +112,7 @@ test("speaks Anthropic Messages: system, tools, tool results, caching, and the r
     tool_calls: [{ id: "toolu_2", type: "function", function: { name: "read_file", arguments: "{\"path\":\"b.ts\"}" } }],
     reasoning_details: [{ type: "thinking", thinking: "", signature: "sig" }],
   });
-  assert.deepEqual(usage, { calls: 1, promptTokens: 95, completionTokens: 7, cachedTokens: 80, reasoningTokens: 0, costUsd: 0 });
+  assert.deepEqual(usage, { calls: 1, promptTokens: 95, completionTokens: 7, cachedTokens: 80, cacheWriteTokens: 5, reasoningTokens: 0, costUsd: 0 });
 });
 
 const SUBMIT = { type: "function" as const, function: { name: "submit", description: "Hand in the answer.", parameters: { type: "object", properties: {} } } };
@@ -280,7 +284,7 @@ test("speaks Responses as the gateway serves it: store false, encrypted reasonin
     role: "assistant", content: "Reading it.", items: output, contextTokens: 1290,
     tool_calls: [{ id: "call_2", type: "function", function: { name: "read_file", arguments: "{\"path\":\"b.ts\"}" } }],
   });
-  assert.deepEqual(usage, { calls: 1, promptTokens: 1200, completionTokens: 90, cachedTokens: 1000, reasoningTokens: 60, costUsd: 0 });
+  assert.deepEqual(usage, { calls: 1, promptTokens: 1200, completionTokens: 90, cachedTokens: 1000, cacheWriteTokens: 0, reasoningTokens: 60, costUsd: 0 });
 
   // The reply goes back as its turn on the next request: its encrypted reasoning whole, its text, and its call
   // without the fields the API adds (a probe through the gateway was refused "Unknown parameter: 'input[1].parsed_arguments'").

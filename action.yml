@@ -21,8 +21,11 @@ inputs:
     description: Pull request to review. Leave empty when the workflow is started by a comment on a pull request.
     default: ""
   command:
-    description: A comment starts a review only when it is this text, or this text followed by a space.
+    description: A comment starts a review only when it is this text, or this text followed by a space or a line break.
     default: /review
+  deep-command:
+    description: A comment that the calling workflow reviews with the review shape, as the shared workflow does with /review deep. The reader's review then ends by saying a maintainer can comment it. Empty, as by default, for none.
+    default: ""
   off-label:
     description: A pull request carrying this label isn't reviewed unless someone comments the command. Put on while a review runs, it keeps that review from posting, and a stopped one from saying so, unless a comment asked for it. Its results are still saved. Empty for none.
     default: no-automated-review
@@ -93,7 +96,7 @@ runs:
         number="${INPUT_NUMBER:-$EVENT_NUMBER}"
         if [ "$EVENT_NAME" = issue_comment ]; then
           [ -n "$COMMENT_ON_PR" ] || skip "the comment is not on a pull request"
-          case "$COMMENT" in "$COMMAND"|"$COMMAND "*) ;; *) skip "the comment is not $COMMAND" ;; esac
+          case "$COMMENT" in "$COMMAND"|"$COMMAND"[[:space:]]*) ;; *) skip "the comment is not $COMMAND" ;; esac
           number="$EVENT_NUMBER"
         fi
         case "$number" in ''|*[!0-9]*) echo "::error::No pull request number. Set pr-number."; exit 1 ;; esac
@@ -513,6 +516,7 @@ runs:
         REVIEW_MODEL: ${{ inputs.model }}
         MIN_SEVERITY: ${{ inputs.min-severity }}
         MAX_COMMENTS: ${{ inputs.max-findings }}
+        DEEP_COMMAND: ${{ inputs.deep-command }}
         EVENT_NAME: ${{ github.event_name }}
         OFF_LABEL: ${{ inputs.off-label }}
         COMMAND: ${{ inputs.command }}
@@ -533,7 +537,7 @@ runs:
         docker run --rm --entrypoint node "${shape[@]}" \
           -v "$GITHUB_ACTION_PATH/action:/agent/action:ro" \
           -v "$RUNNER_TEMP/rev-engine-prime:/work:ro" \
-          -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_GRAPHQL_URL -e GITHUB_SERVER_URL -e RB_NWO -e RB_PR_NUMBER -e RB_HEAD -e REVIEW_MODEL -e MIN_SEVERITY -e MAX_COMMENTS \
+          -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_GRAPHQL_URL -e GITHUB_SERVER_URL -e RB_NWO -e RB_PR_NUMBER -e RB_HEAD -e REVIEW_MODEL -e MIN_SEVERITY -e MAX_COMMENTS -e DEEP_COMMAND \
           -e FINDINGS_PATH=/work/out/details.json -e FIT_PATH=/work/out/fit.json -e DIFF_PATH=/work/pr/diff.patch \
           rev-engine-prime:action /agent/action/post.ts
 

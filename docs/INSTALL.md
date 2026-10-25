@@ -22,7 +22,7 @@ permissions:
   issues: read # for pipeline: shape, whose judge reads the repository's open issues
 jobs:
   review:
-    if: github.event_name == 'workflow_dispatch' || (github.event.issue.pull_request && (startsWith(github.event.comment.body, '/review ') || github.event.comment.body == '/review'))
+    if: github.event_name == 'workflow_dispatch' || (github.event.issue.pull_request && startsWith(github.event.comment.body, '/review'))
     runs-on: ubuntu-latest
     timeout-minutes: 30 # the reader's; for pipeline: shape, up to 360, past its own 5.5-hour limit, as org-review.yml sets
     steps:
@@ -49,7 +49,8 @@ On a later review of the same pull request, the action first collects what the m
 | `max-findings` | `10` | Cap on findings that get a comment. The rest join the collapsed section. The shape lists the change's blockers and should-fix issues open in the summary whether they get a comment or not, its minor issues folded by file, and issues in existing code (there before the change) folded apart below them, as far as GitHub's size limit allows, the rest counted, and as a last resort the summary's tail cut, saying so. |
 | `fit` | `on` | Say whether the change belongs in the project. |
 | `time-budget` | `780` | Seconds allowed for the review. The shape doesn't use it: it stops itself at 5.5 hours, inside the job's six, with what it read kept. |
-| `command` | `/review` | A comment starts a review only when it is this text, or this text followed by a space. |
+| `command` | `/review` | A comment starts a review only when it is this text, or this text followed by a space or a line break. |
+| `deep-command` | none | A comment your workflow reviews with the review shape (`pipeline: shape`), as `.github/workflows/org-review.yml` does with `/review deep` whatever the repository's default. The reader's review then ends by saying a maintainer can comment it for a deeper review. Routing the comment is the workflow's: the Action only names it. |
 | `off-label` | `no-automated-review` | A pull request carrying this label isn't reviewed when it's opened or by a manual run; a comment of `command` still reviews it. Put on while a review runs, it keeps that review from posting, and a stopped one from saying so, unless a comment asked for it; the run's results are still saved as its artifacts (the shape's sealed, as the Security section says). Empty turns the label off. |
 | `allow-forks` | `false` | Set to `true` to review pull requests from forks. |
 | `authors` | `writers` | Which pull request events start a review: with `writers`, only those raised by someone who can push to the repository, such as its opening or reopening; with `any`, every one, for a workflow that chooses itself which pull requests to review. A comment or a manual run always needs a person with write access. |

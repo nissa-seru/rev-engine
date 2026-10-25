@@ -495,6 +495,7 @@ export interface ShapeOptions {
   sol: Chat;
   run: ShapeRun;
   usageByCaller: Map<string, Usage>;
+  usageByModel: Map<string, Usage>;
   log: (message: string) => void;
 }
 
@@ -512,7 +513,7 @@ export async function shapeReview(options: ShapeOptions): Promise<ShapeOutcome> 
     const stop = stopFor(error, deadline, "a stage of the review");
     options.log(`stopped: ${stop.detail}`);
     await mkdir(options.run.outDir, { recursive: true })
-      .then(() => writeJson(join(options.run.outDir, "run.json"), runRecord(options.run, options.config, stop, started, options.usageByCaller)))
+      .then(() => writeJson(join(options.run.outDir, "run.json"), runRecord(options.run, options.config, stop, started, options)))
       .catch((failure: unknown) => options.log(`the stop couldn't be recorded in run.json: ${told(failure)}`));
     return { stop, findings: [], review: null };
   }
@@ -664,7 +665,7 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   if (solFailure) {
     const stop = stopFor(solFailure.error, deadline, `a Sol call (${solFailure.area} A:${solFailure.call})`, solFailure.at, SOL_WRAP_UP_MS + LIMIT_MARGIN_MS);
     // A record that can't be written mustn't turn this stop (a refusal, say) into a failure of the stage.
-    await writeJson(join(run.outDir, "run.json"), runRecord(run, config, stop, started, options.usageByCaller))
+    await writeJson(join(run.outDir, "run.json"), runRecord(run, config, stop, started, options))
       .catch((error: unknown) => log(`the stop couldn't be recorded in run.json: ${told(error)}`));
     log(`stopped: ${stop.detail}`);
     return { stop, findings: [], review: null };
@@ -737,7 +738,7 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   if (issueCount && unjudgedCount === issueCount) {
     const errors = [...new Set(judged.flatMap((entry) => entry.judging.errors))];
     const stop: ShapeStop = { reason: Date.now() >= deadline - LIMIT_MARGIN_MS ? "time" : "failed", detail: `the judge gave no verdict on any of the ${issueCount} issue(s)${errors.length ? `; its calls failed with ${errors.join("; ")}` : ""}` };
-    await writeJson(join(run.outDir, "run.json"), runRecord(run, config, stop, started, options.usageByCaller));
+    await writeJson(join(run.outDir, "run.json"), runRecord(run, config, stop, started, options));
     log(`stopped: ${stop.detail}`);
     return { stop, findings: [], review: null };
   }
@@ -756,7 +757,7 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   review.withoutDependencies = around.javascript && !around.installed;
   review.dependenciesFromRanges = around.fromRanges;
   await writeJson(join(run.outDir, "shape-review.json"), review);
-  await writeJson(join(run.outDir, "run.json"), runRecord(run, config, null, started, options.usageByCaller));
+  await writeJson(join(run.outDir, "run.json"), runRecord(run, config, null, started, options));
   log(outcomeLine(review));
   // The findings file places each issue in the repository at head; one with no such place is posted, not filed there.
   const unplaced = review.issues.filter((issue) => !shownPlace(issue)).map((issue) => issue.id);
@@ -888,13 +889,14 @@ export function toFinding(issue: PostedIssue, producer: string): OutputFinding |
 }
 
 /** The run's record: which review it was, of what base and head, how it ended, and what it cost. */
-function runRecord(run: ShapeRun, config: Config, stop: ShapeStop | null, started: number, usageByCaller: Map<string, Usage>): Record<string, unknown> {
+function runRecord(run: ShapeRun, config: Config, stop: ShapeStop | null, started: number, spent: Pick<ShapeOptions, "usageByCaller" | "usageByModel">): Record<string, unknown> {
   return {
     label: run.label, round: run.round, ...(run.roundOf ? { roundOf: run.roundOf } : {}), base: config.base, head: config.head,
     outcome: stop ? `stopped: ${stop.reason}` : "done", ...(stop ? { stop } : {}),
     workflowRun: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
     resumedFrom: run.resumed ? process.env.RB_SHAPE_RESUMED_FROM ?? "an earlier run" : null,
     seconds: Math.round((Date.now() - started) / 1000),
-    usage: Object.fromEntries(usageByCaller),
+    usage: Object.fromEntries(spent.usageByCaller),
+    usageByModel: Object.fromEntries(spent.usageByModel),
   };
 }

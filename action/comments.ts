@@ -180,6 +180,8 @@ export interface ReviewInput {
   maxComments: number;
   /** Ids of earlier decided findings that this review's verifier found repeated, one per finding left out. */
   decided?: string[];
+  /** A comment that starts a deeper review, named at the review's end. */
+  deepCommand?: string;
 }
 
 function location(finding: Finding): string {
@@ -306,6 +308,7 @@ export function buildReview(input: ReviewInput, links: Array<string | undefined>
     lines.push(`<details>\n<summary>${count(collapsed.length, "more finding")}, ${why}</summary>\n\n${collapsed.map(listed).join("\n")}\n\n</details>`);
   }
   sections.push(`#### Findings\n\n${lines.join("\n\n")}`);
+  if (input.deepCommand) sections.push(`For a deeper review by several readers and a judge, which takes longer, a maintainer can comment \`${input.deepCommand}\`.`);
   return { body: `${sections.join("\n\n")}\n\n${MARKER}`, comments };
 }
 

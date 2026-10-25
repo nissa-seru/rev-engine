@@ -187,7 +187,7 @@ try {
   const diff = await readFile(required("DIFF_PATH"), "utf8");
   const input = {
     findings: output.findings, fit, hunks: parseHunks(diff), existing: await existingComments(), settled: await settledComments(), head,
-    model: process.env.REVIEW_MODEL?.trim() || "a model", minSeverity, maxComments,
+    model: process.env.REVIEW_MODEL?.trim() || "a model", minSeverity, maxComments, deepCommand: process.env.DEEP_COMMAND?.trim() || undefined,
     decided: (output.decided ?? []).flatMap((repeat) => typeof repeat.repeat_of === "string" ? [repeat.repeat_of] : []),
   };
   const parts = quietParts(buildReview(input));
