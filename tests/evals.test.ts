@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import type { Finding } from "../action/comments.ts";
-import { adviceLabel, parseCase, renderReport, scoreCase, totals, withEarlierDecisions, type EvalCase, type RunResult } from "../evals/lib.ts";
+import { actionReviewNamed, adviceLabel, parseCase, renderReport, scoreCase, totals, withEarlierDecisions, type EvalCase, type RunResult } from "../evals/lib.ts";
 import { prKey, toReviewBench } from "../evals/reviewbench.ts";
 
 const CASE: EvalCase = {
@@ -24,6 +24,21 @@ test("every case file in the repository is well formed", () => {
     const parsed = parseCase(JSON.parse(readFileSync(`evals/cases/${file}`, "utf8")), file);
     assert.equal(`${parsed.id}.json`, file);
   }
+});
+
+test("an Action review names the commit it read: the reader's in its header, the shape's in its own marker line", () => {
+  const head = "a".repeat(40);
+  // The reader's header as action/comments.ts writes it.
+  const reader = "### Automated review\n\nNo findings.\n\nReviewed commit abc1234 with gpt-6.1, by reading the code. It did not run the code or look at the checks.\n\n<!-- rev-engine-prime -->";
+  assert.deepEqual(actionReviewNamed(reader), { commit: "abc1234", model: "gpt-6.1", shape: false }, "the model without the header's comma");
+  const shape = `### Automated review\n\nReviewed commit aaaaaaa by reading the code, in four stages.\n\n<!-- rev-engine-shape-review re-o.n-1-2 ${head} -->\n<!-- rev-engine-prime -->`;
+  assert.deepEqual(actionReviewNamed(shape), { commit: head, shape: true }, "the whole head, from the marker on the last line but one");
+  assert.deepEqual(actionReviewNamed(shape.replace("-->\n<!-- rev-engine-prime", "-->\n\n<!-- rev-engine-prime") + "\n"), { commit: head, shape: true }, "empty lines don't count");
+  const quoting = `Reviewed commit abc1234 with m, by reading the code.\n\nA finding quotes a summary:\n<!-- rev-engine-shape-review re-o.n-1-2 ${head} -->\nand goes on.\n\n<!-- rev-engine-prime -->`;
+  assert.deepEqual(actionReviewNamed(quoting), { commit: "abc1234", model: "m", shape: false }, "a marker quoted on a line of its own elsewhere isn't the shape's");
+  const inline = `Reviewed commit abc1234 with m, by reading the code.\n\nIt ends quoting <!-- rev-engine-shape-review re-o.n-1-2 ${head} --> inside a line\n<!-- rev-engine-prime -->`;
+  assert.deepEqual(actionReviewNamed(inline), { commit: "abc1234", model: "m", shape: false }, "on the last line but one, the marker is the whole line");
+  assert.deepEqual(actionReviewNamed("no commit named"), { commit: "", shape: false });
 });
 
 test("rejects a malformed case", () => {

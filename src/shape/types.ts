@@ -18,6 +18,27 @@ export function clause(parts: string[]): string {
   return /[?!]$/.test(joined) ? joined : `${joined}.`;
 }
 
+/** One hunk of a changed file's diff: the lines read_diff numbers it by, its size, and the head lines it spans, git's context around its changes included. */
+export interface Hunk {
+  lines: [number, number];
+  chars: number;
+  /** The file's lines at head the hunk spans, from its header; a hunk that only removes lines spans the two around them. */
+  head: [number, number];
+}
+
+/** A files or tests entry of a plan's slice: a path, or path:from-to for part of a file too big for one slice. */
+export function entryOf(entry: string): { path: string; range: [number, number] | null } {
+  const range = entry.match(/^(.*):([0-9]+)-([0-9]+)$/);
+  return range ? { path: range[1]!, range: [Number(range[2]), Number(range[3])] } : { path: entry, range: null };
+}
+
+/** The hunks of its file an entry reads: every one, or for a range, those whose lines at head, git's context around each change included, reach into it. */
+export function entryHunks(hunks: Map<string, Hunk[]>, entry: string): Hunk[] {
+  const { path, range } = entryOf(entry);
+  const all = hunks.get(path) ?? [];
+  return range ? all.filter((hunk) => hunk.head[0] <= range[1] && hunk.head[1] >= range[0]) : all;
+}
+
 export type Kind = "code" | "test" | "text";
 export const KINDS: readonly Kind[] = ["code", "test", "text"];
 

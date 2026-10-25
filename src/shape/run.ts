@@ -10,16 +10,16 @@ import { promisify } from "node:util";
 import type { Config } from "../config.ts";
 import { pickDesignDocs } from "../docs.ts";
 import { parseDiff, type OutputFinding } from "../findings.ts";
-import { ModelError, ModelRefused, ModelUnavailable, type Chat, type Usage } from "../llm.ts";
+import { ModelError, ModelRefused, ModelUnavailable, told, type Chat, type Usage } from "../llm.ts";
 import { loadPrior } from "../prior.ts";
 import { GENERATED, loadPullRequest, loadRules } from "../review.ts";
-import { safeRelativePath, Workspace, type ChangeTexts, type ReadRecord } from "../tools.ts";
+import { safeRelativePath, Workspace, type ChangeTexts, type KnownTexts, type ReadRecord } from "../tools.ts";
 import { callsOf, numberedLines, runFind, TEXT_FILES, type Battery, type ChangeBrief, type FindAnswer } from "./find.ts";
 import { groupFindings } from "./group.ts";
-import { judgeIssues, type JudgeVerdict } from "./judge.ts";
+import { judgeIssues, parseKnown, type JudgeVerdict, type Known } from "./judge.ts";
 import { writePlan, type Area, type Lens, type Plan, type Task } from "./plan.ts";
 import { settleSeverities } from "./severity.ts";
-import { clause, SEVERITY_RANK, type Finding, type Issue, type Kind, type Place, type Severity } from "./types.ts";
+import { clause, entryOf, SEVERITY_RANK, type Finding, type Hunk, type Issue, type Kind, type Place, type Severity } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -77,6 +77,18 @@ export interface PostedIssue {
   consequences: string[];
   failingCase: string;
   why: string;
+  /** Whether it is in what the change adds or alters, or in code the base already has (the judge's origin). */
+  origin: "change" | "base";
+  /** Whether fixing it would be a security fix, by the judge. */
+  security: boolean;
+  /** Where it is already named: "description", a thread item's or an open issue's URL, or "". */
+  knownAt: string;
+  /** The judge's text of the issue, by reading. */
+  text: string;
+  /** The run that would confirm it, which the review shows for a blocker or should-fix; "" when the judge gave none. */
+  confirm: string;
+  /** The ids of issues from other areas that name the same defect, folded into this one by the severity check. */
+  repeats: string[];
 }
 
 /** What the posting step reads: the review's issues and everything it says about how the review went. */
@@ -87,8 +99,13 @@ export interface ShapeReview {
   /** The commit the review read from, and the label of the earlier review whose head that is, when it read only what changed since. */
   base: string;
   roundOf: string | null;
+  /** The repository, owner/name, which the review's links point into. */
+  repo: string;
   models: { planner: string; batteryA: string; batteryB: string; judge: string };
+  /** The issues it posts: every real or unsure one but those held. */
   issues: PostedIssue[];
+  /** Security issues in code the base already has, which aren't posted: whoever set up the review, who holds the model key the saved run is sealed with, decides what becomes of them. */
+  held: PostedIssue[];
   notReal: Array<{ area: string; id: string; title: string; notRealKind: string; why: string; places: Place[] }>;
   decided: Array<{ area: string; id: string; title: string; repeatOf: string }>;
   unjudged: Array<{ area: string; id: string; title: string }>;
@@ -136,10 +153,6 @@ export interface ShapeRun {
   resumed?: boolean;
 }
 
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 /**
  * Why a failure stops the review. A refusal keeps its category alone, and a request the API rejected (a 4xx other
  * than 408 or 429) fails whenever it happened, since sending it again gets the same. Any other failure within `margin`
@@ -150,7 +163,7 @@ function describe(error: unknown): string {
 export function stopReasonOf(error: unknown, deadline: number, at = Date.now(), margin = LIMIT_MARGIN_MS): { reason: StopReason; category?: string } {
   if (error instanceof ModelRefused) return { reason: "refused", category: error.category };
   if (error instanceof ModelError && !(error instanceof ModelUnavailable) && error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429) return { reason: "failed" };
-  if (at >= deadline - margin || /ran out of time before submitting/.test(describe(error))) return { reason: "time" };
+  if (at >= deadline - margin || /ran out of time before submitting/.test(told(error))) return { reason: "time" };
   if (error instanceof ModelUnavailable) return { reason: "sol-unavailable" };
   return { reason: "failed" };
 }
@@ -170,7 +183,7 @@ export function decidingFailure<T extends { why: { reason: StopReason } }>(failu
 export function stopFor(error: unknown, deadline: number, where: string, at = Date.now(), margin = LIMIT_MARGIN_MS): ShapeStop {
   const why = stopReasonOf(error, deadline, at, margin);
   if (why.reason === "refused") return { reason: "refused", ...(why.category ? { category: why.category } : {}), detail: `${where} was refused (${why.category ?? "category not given"})` };
-  return { reason: why.reason, detail: `${where} failed: ${describe(error)}` };
+  return { reason: why.reason, detail: `${where} failed: ${told(error)}` };
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
@@ -217,24 +230,39 @@ export function diffHeaderPath(text: string): string {
   return Buffer.from(bytes).toString("utf8");
 }
 
-/** For each changed file, the lines of the diff (as read_diff numbers them) its part spans, and its size in characters. */
-export function diffParts(diff: string): { lines: Map<string, [number, number]>; chars: Map<string, number> } {
+/**
+ * For each changed file, the lines of the diff (as read_diff numbers them) its part spans, its size in characters, and
+ * its hunks, so a slice of part of a file is measured and pointed to by the hunks that reach into it.
+ */
+export function diffParts(diff: string): { lines: Map<string, [number, number]>; chars: Map<string, number>; hunks: Map<string, Hunk[]> } {
   const lines = new Map<string, [number, number]>();
   const chars = new Map<string, number>();
+  const hunks = new Map<string, Hunk[]>();
   const all = diff.split("\n");
   if (all.at(-1) === "") all.pop();
-  let current: { path: string; start: number; size: number; named: boolean; old?: string } | null = null;
+  let current: { path: string; start: number; size: number; named: boolean; old?: string; hunks: Hunk[] } | null = null;
   const close = (end: number): void => {
     if (!current) return;
+    const last = current.hunks.at(-1);
+    if (last) last.lines[1] = end;
     lines.set(current.path, [current.start, end]);
     chars.set(current.path, current.size);
+    hunks.set(current.path, current.hunks);
   };
   for (const [index, text] of all.entries()) {
+    const hunk = current ? /^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,([0-9]+))? @@/.exec(text) : null;
     if (text.startsWith("diff --git ")) {
       close(index);
       // The new path is the header's b/ path; a later +++ line names it exactly when the header can't be split.
       const header = /^diff --git a\/(.*) b\/(.*)$/.exec(text);
-      current = { path: header?.[2] ?? "", start: index + 1, size: 0, named: Boolean(header) };
+      current = { path: header?.[2] ?? "", start: index + 1, size: 0, named: Boolean(header), hunks: [] };
+    } else if (current && hunk) {
+      const last = current.hunks.at(-1);
+      if (last) last.lines[1] = index;
+      // "+c,d" spans head lines c to c+d-1; with no count it is one line, and with 0 it only removes, between c and c+1.
+      const from = Number(hunk[1]);
+      const count = hunk[2] === undefined ? 1 : Number(hunk[2]);
+      current.hunks.push({ lines: [index + 1, index + 1], chars: 0, head: count ? [from, from + count - 1] : [from, from + 1] });
     } else if (current && !current.named && text.startsWith("--- ")) {
       // A file the change deletes is named only here, since its +++ line is /dev/null.
       const path = diffHeaderPath(text.slice(4));
@@ -244,10 +272,42 @@ export function diffParts(diff: string): { lines: Map<string, [number, number]>;
       current.path = path !== "/dev/null" ? path.replace(/^b\//, "") : current.old ?? "";
       current.named = true;
     }
-    if (current) current.size += text.length + 1;
+    if (current) {
+      current.size += text.length + 1;
+      const last = current.hunks.at(-1);
+      if (last) last.chars += text.length + 1;
+    }
   }
   close(all.length);
-  return { lines, chars };
+  return { lines, chars, hunks };
+}
+
+/**
+ * The pull request's thread and the repository's open issues, as the collector leaves them beside prior.json, or null
+ * when it left none (it couldn't read them) or what it left can't be read; the review then says so among its problems.
+ */
+export async function loadKnown(path: string, log: (message: string) => void): Promise<Known | null> {
+  const text = await readFile(path, "utf8").catch(() => null);
+  if (text === null) {
+    log("no thread or open issues were collected, so the judge can't tell an issue raised before");
+    return null;
+  }
+  let known: Known | null = null;
+  try {
+    known = parseKnown(JSON.parse(text));
+  } catch {
+    known = null;
+  }
+  log(known ? `the judge reads ${known.thread.length} thread item(s) and ${known.issuesError ? `no open issues (${known.issuesError})` : `${known.issues.length} open issue(s)${known.more ? ", the newest of more" : ""}`}` : "ignoring known.json, which isn't the collector's shape");
+  return known;
+}
+
+/** What the review couldn't check for an issue raised before, for its saved problems, or null when it read it all. */
+export function knownProblem(known: Known | null): string | null {
+  if (!known) return "The pull request's thread and the repository's open issues weren't read, so an issue raised there before may be raised here again.";
+  if (known.issuesError) return `The repository's open issues weren't read, so an issue filed there before may be raised here again. Where GitHub refused them, the workflow needs the permission issues: read. The collector said: ${known.issuesError.trim().replace(/[.\s]+$/, "")}.`;
+  if (known.more) return `The judge read the newest ${known.issues.length} of the repository's open issues, not the older ones, so an issue filed in one of those may be raised here again.`;
+  return null;
 }
 
 async function commitMessages(config: Config, log: (message: string) => void): Promise<string> {
@@ -257,7 +317,7 @@ async function commitMessages(config: Config, log: (message: string) => void): P
     });
     return stdout.length > MAX_COMMIT_MESSAGE_CHARS ? `${stdout.slice(0, MAX_COMMIT_MESSAGE_CHARS)}\n[cut here]` : stdout;
   } catch (error) {
-    log(`the commit messages couldn't be read, so the review goes without them: ${describe(error)}`);
+    log(`the commit messages couldn't be read, so the review goes without them: ${told(error)}`);
     return "";
   }
 }
@@ -409,7 +469,7 @@ export async function keptAnswers(dir: string | null, log: (message: string) => 
   try {
     names = await readdir(join(dir, "answers"));
   } catch (error) {
-    log(`no kept answers were read from ${join(dir, "answers")} (${describe(error)}), so its calls are asked again`);
+    log(`no kept answers were read from ${join(dir, "answers")} (${told(error)}), so its calls are asked again`);
     return [];
   }
   const answers: FindAnswer[] = [];
@@ -451,7 +511,7 @@ export async function shapeReview(options: ShapeOptions): Promise<ShapeOutcome> 
     options.log(`stopped: ${stop.detail}`);
     await mkdir(options.run.outDir, { recursive: true })
       .then(() => writeJson(join(options.run.outDir, "run.json"), runRecord(options.run, options.config, stop, started, options.usageByCaller)))
-      .catch((failure: unknown) => options.log(`the stop couldn't be recorded in run.json: ${describe(failure)}`));
+      .catch((failure: unknown) => options.log(`the stop couldn't be recorded in run.json: ${told(failure)}`));
     return { stop, findings: [], review: null };
   }
 }
@@ -459,8 +519,9 @@ export async function shapeReview(options: ShapeOptions): Promise<ShapeOutcome> 
 async function reviewStages(options: ShapeOptions, started: number, deadline: number): Promise<ShapeOutcome> {
   const { config, claude, sol, run, log } = options;
   const opus = config.models[0]!;
-  // A finder's workspace serves the change's description and commit messages too; the planner's and the judge's don't.
-  const workspace = (texts: ChangeTexts | null = null): Workspace => new Workspace(config.repoDir, config.diffPath, config.base, texts);
+  // A finder's workspace serves the change's description and commit messages too, and the judge's the thread and open
+  // issues; the planner's serves neither.
+  const workspace = (texts: ChangeTexts | null = null, known: KnownTexts | null = null): Workspace => new Workspace(config.repoDir, config.diffPath, config.base, texts, known);
   const main = workspace();
   // Project rules as the pull request's base has them, which in a later round isn't the base the review reads from.
   const rulesBase = config.shape?.rulesBase ?? config.base;
@@ -468,7 +529,7 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   // Each lens's title and Look-for text, ported by hand from its source (`name`, `blob`) and worded for any project's
   // review; a later change at the source is ported by hand, as the briefs are.
   const lenses = JSON.parse(await readFile(new URL("./lenses.json", import.meta.url), "utf8")) as Record<string, Lens>;
-  const [pr, diff, rules, prior, messages] = await Promise.all([loadPullRequest(config), main.diff(), loadRules(rulesWorkspace), loadPrior(config.priorJsonPath, log), commitMessages(config, log)]);
+  const [pr, diff, rules, prior, messages, known] = await Promise.all([loadPullRequest(config), main.diff(), loadRules(rulesWorkspace), loadPrior(config.priorJsonPath, log), commitMessages(config, log), loadKnown(join(dirname(config.priorJsonPath), "known.json"), log)]);
   // The change's own text is cited by its lines as the finders are given it.
   const textLines: Record<string, number> = { "change-text.md": numberedLines(pr.body), "commit-messages.txt": numberedLines(messages) };
   // Counted once a file, since every citation of it asks again.
@@ -544,13 +605,13 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
       },
       {
         chat: claude, model: opus, effort: EFFORT.opus, workspace: workspace(), deadline, maxTurns: MAX_TURNS, lenses, log,
-        context: { lensIds: Object.keys(lenses), diffChars: parts.chars, generated: leftToSource, headLines },
+        context: { lensIds: Object.keys(lenses), diffChars: parts.chars, hunks: parts.hunks, generated: leftToSource, headLines },
       },
     );
     ({ plan, problems } = planned);
   }
   // A checkpoint that can't be written costs a resume, not this run.
-  await writeJson(join(run.outDir, "shape-plan.json"), { ...identity, plan, problems }).catch((error: unknown) => log(`the plan couldn't be kept for a resume: ${describe(error)}`));
+  await writeJson(join(run.outDir, "shape-plan.json"), { ...identity, plan, problems }).catch((error: unknown) => log(`the plan couldn't be kept for a resume: ${told(error)}`));
   log(`plan: ${plan.areas.length} area(s), ${plan.areas.reduce((sum, area) => sum + area.tasks.length + area.questions.length, 0)} task(s) and question(s), ${plan.facts.length} fact(s)`);
 
   const batteries: Battery[] = [
@@ -573,11 +634,11 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
     await mkdir(join(dir, "answers"), { recursive: true });
     if (!inPlace) {
       for (const answer of kept) {
-        await writeJson(join(dir, "answers", `${answer.battery}-${answer.call}.json`), answer).catch((error: unknown) => log(`a kept answer couldn't be kept again for a resume: ${describe(error)}`));
+        await writeJson(join(dir, "answers", `${answer.battery}-${answer.call}.json`), answer).catch((error: unknown) => log(`a kept answer couldn't be kept again for a resume: ${told(error)}`));
       }
     }
     const change: ChangeBrief = {
-      diffLines: parts.lines, title: pr.title, description: pr.body, commitMessages: messages, facts: plan.facts, roundNote,
+      diffLines: parts.lines, hunks: parts.hunks, title: pr.title, description: pr.body, commitMessages: messages, facts: plan.facts, roundNote,
       dependencies: around.text, areaFiles: plan.areas.length > 1 ? area.files : null,
     };
     const chats = new Map(batteries.map((battery) => [battery.letter, chatOf(battery.letter)]));
@@ -602,7 +663,7 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
     const stop = stopFor(solFailure.error, deadline, `a Sol call (${solFailure.area} A:${solFailure.call})`, solFailure.at, SOL_WRAP_UP_MS + LIMIT_MARGIN_MS);
     // A record that can't be written mustn't turn this stop (a refusal, say) into a failure of the stage.
     await writeJson(join(run.outDir, "run.json"), runRecord(run, config, stop, started, options.usageByCaller))
-      .catch((error: unknown) => log(`the stop couldn't be recorded in run.json: ${describe(error)}`));
+      .catch((error: unknown) => log(`the stop couldn't be recorded in run.json: ${told(error)}`));
     log(`stopped: ${stop.detail}`);
     return { stop, findings: [], review: null };
   }
@@ -615,8 +676,10 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
       chat: claude, smallModel: SHAPE_MODELS.haiku, largeModel: opus, smallEffort: EFFORT.haiku, largeEffort: EFFORT.opus, workspace: main, deadline, log, caller: `group ${area.name}`,
     });
     const judging = await judgeIssues(grouping.issues, all, {
-      chat: claude, model: opus, effort: EFFORT.opus, workspace, prior: decisions, change: { title: pr.title, description: pr.body, commitMessages: messages, facts: plan.facts },
-      deadline, maxTurns: MAX_TURNS, log, caller: `judge ${area.name}`,
+      // The judge tells the change's code from the base's (an issue's origin) against the pull request's target, which in
+      // a later round isn't the base the review reads from: that one holds the pull request's own earlier commits.
+      chat: claude, model: opus, effort: EFFORT.opus, workspace: (texts) => new Workspace(config.repoDir, config.diffPath, rulesBase, null, texts), prior: decisions, change: { title: pr.title, description: pr.body, commitMessages: messages, facts: plan.facts },
+      known, dependencies: around.text, withoutDependencies: !around.installed, laterRound: Boolean(run.roundOf), deadline, maxTurns: MAX_TURNS, log, caller: `judge ${area.name}`,
     });
     const tasks = areaTasks(area);
     const asked = (letter: string): string[] => callsOf(batteries.find((battery) => battery.letter === letter)!, tasks).map((call) => call.id);
@@ -658,6 +721,8 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
     { chat: claude, model: opus, effort: EFFORT.opus, workspace: main, deadline, log },
   );
   if (settled.problem) problems.push(settled.problem);
+  const unknown = knownProblem(known);
+  if (unknown) problems.push(unknown);
   for (const { area, verdict } of kept) verdict.severity = settled.severities.get(key(area, verdict.issue)) ?? verdict.judgedSeverity;
   for (const { dir, judging } of judged) {
     const at = new Date().toISOString();
@@ -678,10 +743,10 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   for (const { area, judging } of judged) {
     if (judging.unjudged.length && judging.errors.length) problems.push(`The judge${plan.areas.length > 1 ? ` (area ${area.name})` : ""} gave no verdict on ${judging.unjudged.length} issue(s); its calls that failed along the way failed with ${judging.errors.join("; ")}.`);
   }
-  const review = assembleReview(run, config.head, config.base, { planner: opus, batteryA: SHAPE_MODELS.sol, batteryB: SHAPE_MODELS.haiku, judge: opus }, judged, plan, problems, changedFiles, key, diff);
+  const review = assembleReview(run, config.head, config.base, { planner: opus, batteryA: SHAPE_MODELS.sol, batteryB: SHAPE_MODELS.haiku, judge: opus }, judged, plan, problems, changedFiles, key, diff, settled.sameAs, config.nwo);
   // The maintainers' decisions this review collected go to its first area's run directory, which the store keys them by.
   const decided = await readFile(join(dirname(config.priorJsonPath), "decisions.jsonl"), "utf8").catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "ENOENT") log(`the maintainers' decisions couldn't be read, so the run directory goes without them: ${describe(error)}`);
+    if (error.code !== "ENOENT") log(`the maintainers' decisions couldn't be read, so the run directory goes without them: ${told(error)}`);
     return "";
   });
   if (decided.trim() && judged.length) await writeJson(join(judged[0]!.dir, "decisions.jsonl"), decided);
@@ -690,7 +755,7 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   review.dependenciesFromRanges = around.fromRanges;
   await writeJson(join(run.outDir, "shape-review.json"), review);
   await writeJson(join(run.outDir, "run.json"), runRecord(run, config, null, started, options.usageByCaller));
-  log(`${review.issues.length} issue(s) to post, ${review.notReal.length} judged not real, ${review.decided.length} decided before, ${review.unjudged.length} unjudged`);
+  log(outcomeLine(review));
   // The findings file places each issue in the repository at head; one with no such place is posted, not filed there.
   const unplaced = review.issues.filter((issue) => !shownPlace(issue)).map((issue) => issue.id);
   if (unplaced.length) log(`${unplaced.length} issue(s) with no place in the repository at head are left out of the findings file: ${unplaced.join(", ")}`);
@@ -706,22 +771,34 @@ export interface AreaResult {
   all: Finding[];
 }
 
-/** The review as posted: every area's issues by the judge's verdict, how its readers went, and what they read of the diff. */
-export function assembleReview(run: ShapeRun, head: string, base: string, models: ShapeReview["models"], results: AreaResult[], plan: Plan, problems: string[], changedFiles: string[], key: (area: string, id: string) => string, diff: string): ShapeReview {
+/** Places with each named once: the same line of the same file, at head or at the base, is one place. */
+function distinctPlaces(places: Place[]): Place[] {
+  return places.filter((spot, at) => places.findIndex((other) => other.file === spot.file && other.line === spot.line && Boolean(other.base) === Boolean(spot.base)) === at);
+}
+
+/**
+ * The review from every area's results, each issue's places named once. An issue the severity check named as
+ * repeating another (`sameAs`, by key) is folded into it: its places and readers join the first's, which keeps the
+ * graver grade and names the repeat. The folded issue is security when any of them is. Then it's in code the base
+ * already has when it's security and any of them was placed there, since holding can be undone and posting can't, and
+ * otherwise the change's own when any of them is. A security issue in code the base already has is held, not posted,
+ * whatever its grade.
+ */
+export function assembleReview(run: ShapeRun, head: string, base: string, models: ShapeReview["models"], results: AreaResult[], plan: Plan, problems: string[], changedFiles: string[], key: (area: string, id: string) => string, diff: string, sameAs: Map<string, string> = new Map(), repo = ""): ShapeReview {
   const review: ShapeReview = {
-    label: run.label, head, base, roundOf: run.roundOf, models, issues: [], notReal: [], decided: [], unjudged: [],
+    label: run.label, head, base, roundOf: run.roundOf, repo, models, issues: [], held: [], notReal: [], decided: [], unjudged: [],
     // Every answer of every area, both batteries': a line any of the review's readers read, the review read.
     unreadChanges: unreadChanges(diff, results.flatMap((result) => result.answers).flatMap((answer) => answer.reads)),
     empty: [], shortfall: [], bounded: [], dropped: 0,
     problems: [...problems], planNote: plan.note,
-    leftOut: plan.areas.length > 1 ? changedFiles.filter((file) => !plan.areas.some((area) => area.files.includes(file) || area.tasks.some((task) => (task.slice.files ?? []).some((entry) => entry.replace(/:[0-9]+-[0-9]+$/, "") === file)))) : [],
+    leftOut: plan.areas.length > 1 ? changedFiles.filter((file) => !plan.areas.some((area) => area.files.includes(file) || area.tasks.some((task) => (task.slice.files ?? []).some((entry) => entryOf(entry).path === file)))) : [],
   };
   for (const { area, answers, failed, grouping, judging, all } of results) {
     const byKey = new Map(all.map((finding) => [finding.key, finding]));
     const verdicts = new Map(judging.verdicts.map((verdict) => [verdict.issue, verdict]));
     for (const issue of grouping.issues) {
       const members = issue.findings.map((member) => byKey.get(member)).filter((finding): finding is Finding => Boolean(finding));
-      const places = members.flatMap((finding) => finding.places);
+      const places = distinctPlaces(members.flatMap((finding) => finding.places));
       const verdict = verdicts.get(issue.id);
       const id = key(area.name, issue.id);
       if (!verdict) review.unjudged.push({ area: area.name, id, title: issue.title });
@@ -732,6 +809,7 @@ export function assembleReview(run: ShapeRun, head: string, base: string, models
           area: area.name, id, issue: issue.id, label: areaDir(run, plan, area), title: issue.title, severity: verdict.severity, kind: issue.kind, verdict: verdict.verdict,
           readers: [...new Set(issue.findings.map((member) => member.split(":")[0]!))].sort(),
           places, causes: issue.causes, consequences: issue.consequences, failingCase: members[0]?.failingCase ?? "", why: verdict.why,
+          origin: verdict.origin, security: verdict.security, knownAt: verdict.knownAt, text: verdict.text, confirm: verdict.confirm, repeats: [],
         });
       }
     }
@@ -744,8 +822,40 @@ export function assembleReview(run: ShapeRun, head: string, base: string, models
     for (const failure of failed) review.shortfall.push(`${plan.areas.length > 1 ? `${area.name}/` : ""}${failure.battery}:${failure.call}`);
     for (const problem of grouping.problems) review.problems.push(`Grouping${plan.areas.length > 1 ? ` (area ${area.name})` : ""}: ${problem}.`);
   }
+  const byId = new Map(review.issues.map((issue) => [issue.id, issue]));
+  const repeatsOf = new Map<string, PostedIssue[]>();
+  for (const [id, first] of sameAs) {
+    const repeat = byId.get(id);
+    if (repeat && byId.has(first)) repeatsOf.set(first, [...(repeatsOf.get(first) ?? []), repeat]);
+  }
+  for (const [first, repeats] of repeatsOf) {
+    const kept = byId.get(first)!;
+    const all = [kept, ...repeats];
+    kept.places = distinctPlaces(all.flatMap((issue) => issue.places));
+    kept.readers = [...new Set(all.flatMap((issue) => issue.readers))].sort();
+    kept.severity = all.reduce((graver, issue) => (SEVERITY_RANK[issue.severity] < SEVERITY_RANK[graver] ? issue.severity : graver), kept.severity);
+    if (all.some((issue) => issue.verdict === "real")) kept.verdict = "real";
+    // A security issue any judge placed in the base's code is held: holding can be undone, and posting can't.
+    kept.security = all.some((issue) => issue.security);
+    kept.origin = kept.security && all.some((issue) => issue.origin === "base") ? "base" : all.some((issue) => issue.origin === "change") ? "change" : "base";
+    kept.knownAt = all.find((issue) => issue.knownAt)?.knownAt ?? "";
+    kept.confirm = all.find((issue) => issue.confirm)?.confirm ?? "";
+    kept.repeats = repeats.map((issue) => issue.id);
+  }
+  const standing = review.issues.filter((issue) => !sameAs.has(issue.id) || !byId.has(sameAs.get(issue.id)!));
+  review.held = standing.filter((issue) => issue.security && issue.origin === "base");
+  review.issues = standing.filter((issue) => !review.held.includes(issue));
   review.issues.sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
   return review;
+}
+
+/**
+ * What the public log says of a review's outcome: only what the posted review shows, its issues and those the judge
+ * gave no verdict on. The not-real and decided counts stay in the saved results, since with them a reader of the log
+ * could tell by subtraction that an issue was held.
+ */
+export function outcomeLine(review: Pick<ShapeReview, "issues" | "unjudged">): string {
+  return `${review.issues.length} issue(s) to post, ${review.unjudged.length} unjudged`;
 }
 
 /** Whether a place is in the repository at head: not the change's own text, a file only the base has, or a checkout of a dependency or a consumer. */

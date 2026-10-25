@@ -3,11 +3,11 @@
 // of the change and up to four lenses) and its questions. Then the plan is checked, and asked for once more with
 // its problems named; what still fails is repaired and said in the review.
 import { runAgent } from "../agent.ts";
-import { ModelRefused, ModelUnavailable, type Chat } from "../llm.ts";
+import { ModelRefused, ModelUnavailable, told, type Chat } from "../llm.ts";
 import { UNTRUSTED, type ProjectRule } from "../prompts.ts";
-import type { ToolDefinition, Workspace } from "../tools.ts";
+import { repositoryPath, type ToolDefinition, type Workspace } from "../tools.ts";
 import { PLAN_GUIDANCE } from "./plan-guidance.ts";
-import { HAND_IN_TURNS } from "./types.ts";
+import { entryHunks, entryOf, HAND_IN_TURNS, type Hunk } from "./types.ts";
 
 export interface Lens {
   title: string;
@@ -172,6 +172,17 @@ function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim() !== "").map((item) => item.trim()) : [];
 }
 
+/**
+ * A plan's file entries named as the diff names them (`./src/a.ts` as `src/a.ts`), a range kept, so a slice is measured,
+ * pointed to and counted against the diff's own names, as the workspace already reads it.
+ */
+function files(value: unknown): string[] {
+  return strings(value).map((entry) => {
+    const { path, range } = entryOf(entry);
+    return range ? `${repositoryPath(path)}:${range[0]}-${range[1]}` : repositoryPath(entry);
+  });
+}
+
 /** The plan a submission gives, read leniently: what's malformed becomes empty and is caught by the check. */
 export function parsePlan(value: Record<string, unknown>): Plan {
   const areas = (Array.isArray(value.areas) ? value.areas : []).flatMap((entry): Area[] => {
@@ -186,14 +197,14 @@ export function parsePlan(value: Record<string, unknown>): Plan {
         id: typeof task.id === "string" ? task.id.trim() : "",
         slice: {
           kind: kind ?? "whole",
-          ...(kind === "files" || kind === "tests" ? { files: strings(slice.files) } : {}),
+          ...(kind === "files" || kind === "tests" ? { files: files(slice.files) } : {}),
           ...(kind === "state" && typeof slice.state === "string" ? { state: slice.state.trim() } : {}),
           ...((kind === "files" || kind === "tests") && typeof slice.purpose === "string" && slice.purpose.trim() ? { purpose: slice.purpose.trim() } : {}),
         },
         lenses: strings(task.lenses),
       }];
     });
-    return [{ name: typeof area.name === "string" ? area.name.trim() : "", files: strings(area.files), questions: strings(area.questions), tasks }];
+    return [{ name: typeof area.name === "string" ? area.name.trim() : "", files: files(area.files), questions: strings(area.questions), tasks }];
   });
   return { facts: strings(value.facts), areas, note: typeof value.note === "string" ? value.note.trim() : "" };
 }
@@ -202,13 +213,15 @@ export interface PlanContext {
   lensIds: string[];
   /** Each changed file's size in characters of diff. */
   diffChars: Map<string, number>;
+  /** Each changed file's hunks, which measure a slice of part of a file. */
+  hunks: Map<string, Hunk[]>;
   /** Files no slice needs to cover: generated and vendored files and lockfiles. */
   generated: (path: string) => boolean;
   /** Lines in a file at head, or null when there is no readable file there. */
   headLines: (path: string) => Promise<number | null>;
 }
 
-const pathOf = (entry: string): string => entry.replace(/:[0-9]+-[0-9]+$/, "");
+const pathOf = (entry: string): string => entryOf(entry).path;
 
 /**
  * Characters of diff a state or question reader is shown: the whole change, or in a plan of several areas, its area's
@@ -220,10 +233,16 @@ function reachChars(area: Area, several: boolean, context: PlanContext): number 
     : [...context.diffChars.values()].reduce((sum, size) => sum + size, 0);
 }
 
-/** Characters of diff a task's slice holds: its files' parts, or for a whole or state slice, what reachChars counts. */
+/**
+ * Characters of diff a task's slice holds: its files' parts, a part of a file counted by the hunks that reach into its
+ * range, each part or hunk once; or for a whole or state slice, what reachChars counts.
+ */
 function sliceChars(task: Task, area: Area, several: boolean, context: PlanContext): number {
   if (task.slice.kind === "files" || task.slice.kind === "tests") {
-    return [...new Set((task.slice.files ?? []).map(pathOf))].reduce((sum, path) => sum + (context.diffChars.get(path) ?? 0), 0);
+    const entries = task.slice.files ?? [];
+    const whole = new Set(entries.filter((entry) => !entryOf(entry).range).map(pathOf));
+    const parts = new Set(entries.filter((entry) => !whole.has(pathOf(entry))).flatMap((entry) => entryHunks(context.hunks, entry)));
+    return [...whole].reduce((sum, path) => sum + (context.diffChars.get(path) ?? 0), 0) + [...parts].reduce((sum, hunk) => sum + hunk.chars, 0);
   }
   return reachChars(area, several, context);
 }
@@ -277,23 +296,28 @@ export async function checkPlan(plan: Plan, context: PlanContext): Promise<strin
     if (left.length) problems.push(`these changed files are in no area: ${left.join(", ")}`);
   }
   // Each changed file is some task's to read: a whole slice reads them all, and otherwise a files or tests slice names
-  // it. State and question readers follow what they're asked about, not every file. Generated files go in no slice.
+  // it whole or its ranges take every hunk that changes it (unsliced). State and question readers follow what they're
+  // asked about, not every file. Generated files go in no slice.
   for (const area of plan.areas) {
     const unread = unsliced(area, several, context);
-    if (unread.length) problems.push(`${several ? `area ${area.name} names files` : "these changed files are in"} no task's slice: ${unread.join(", ")}`);
+    if (unread.length) problems.push(`${several ? `area ${area.name} names files that are` : "these changed files are"} in no task's slice, or only in ranges, which read a file only when they take every hunk that changes it (a file whose change has no hunk, such as a rename, needs a whole entry): ${unread.join(", ")}`);
   }
   return problems;
 }
 
 /**
  * The changed files a plan's area holds (its files in a plan of several, the whole change in one) that no slice of
- * it reads: none when a task reads the whole change, and never a generated, vendored or lock file.
+ * it reads: none when a task reads the whole change, and never a generated, vendored or lock file. A file is read when
+ * a files or tests slice names it whole, or when its slices' ranges together take every hunk that changes it.
  */
 function unsliced(area: Area, several: boolean, context: PlanContext): string[] {
   if (!several && area.tasks.some((task) => task.slice.kind === "whole")) return [];
-  const sliced = new Set(area.tasks.flatMap((task) => task.slice.kind === "files" || task.slice.kind === "tests" ? (task.slice.files ?? []).map(pathOf) : []));
+  const entries = area.tasks.flatMap((task) => task.slice.kind === "files" || task.slice.kind === "tests" ? task.slice.files ?? [] : []);
+  const whole = new Set(entries.filter((entry) => !entryOf(entry).range).map(pathOf));
+  const taken = new Set(entries.filter((entry) => entryOf(entry).range).flatMap((entry) => entryHunks(context.hunks, entry)));
+  const ranged = (file: string): boolean => (context.hunks.get(file) ?? []).length > 0 && context.hunks.get(file)!.every((hunk) => taken.has(hunk));
   const files = several ? area.files.filter((file) => context.diffChars.has(file)) : [...context.diffChars.keys()];
-  return files.filter((file) => !sliced.has(file) && !context.generated(file));
+  return files.filter((file) => !whole.has(file) && !ranged(file) && !context.generated(file));
 }
 
 /**
@@ -310,9 +334,10 @@ async function entryFits(entry: string, context: PlanContext): Promise<"ok" | "m
 }
 
 /**
- * A plan that runs, from one that still fails its checks after the second ask: unknown and surplus lenses, and files
- * neither at head nor deleted by the change, are taken out, tasks left with nothing to read are dropped, and changed files in no area get
- * an area of their own. What was repaired is returned to be said in the review.
+ * A plan that runs, from one that still fails its checks after the second ask: unknown and surplus lenses, files
+ * neither at head nor deleted by the change, and ranges that don't fit their file are taken out, tasks left with nothing
+ * to read are dropped, and changed files in no area get an area of their own. What was repaired is returned to be said
+ * in the review.
  */
 export async function repairPlan(plan: Plan, context: PlanContext): Promise<{ plan: Plan; repairs: string[] }> {
   const repairs: string[] = [];
@@ -377,7 +402,7 @@ export async function repairPlan(plan: Plan, context: PlanContext): Promise<{ pl
     const unread = unsliced({ ...area, tasks }, several, context);
     if (unread.length) {
       tasks.push({ id: unique("unsliced", ids), slice: { kind: "files", files: unread }, lenses: [] });
-      repairs.push(`${several ? `area ${name}'s files` : "changed files"} no task read got a task of their own, with no lens: ${unread.join(", ")}`);
+      repairs.push(`${several ? `area ${name}'s files` : "changed files"} that no task read, whole or by ranges taking every hunk that changes them, got a task of their own, with no lens: ${unread.join(", ")}`);
     }
     areas.push({ ...area, name, tasks });
   }
@@ -458,7 +483,7 @@ export async function writePlan(input: PlanInput, options: PlanOptions): Promise
     } catch (error) {
       // A refusal or a model that can't be reached stops the review, as the first ask's would.
       if (error instanceof ModelRefused || error instanceof ModelUnavailable) throw error;
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = told(error);
       options.log(`planner: the second ask gave no plan, keeping the first: ${reason}`);
       secondAsk = `The planner's second ask, with the first plan's problems named, gave no plan, so the first was repaired.`;
     }

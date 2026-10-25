@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import http from "node:http";
-import { createChat, emptyUsage, longFetch, MODEL_REFUSAL, ModelError, ModelRefused, ModelUnavailable, toAnthropic, toResponses, type ChatMessage, type Usage } from "../src/llm.ts";
+import { createChat, emptyUsage, longFetch, MODEL_REFUSAL, ModelError, ModelRefused, ModelUnavailable, toAnthropic, told, toResponses, type ChatMessage, type Usage } from "../src/llm.ts";
 
 function replying(usage: Record<string, unknown>): typeof fetch {
   return (async () => new Response(JSON.stringify({
@@ -334,6 +334,7 @@ test("no account to be had, every account at its limit, a server error, or no ro
     ["500", () => new Response(JSON.stringify({ error: { message: "upstream error" } }), { status: 500 })],
     ["504", () => new Response("gateway timeout", { status: 504 })],
     ["429", () => new Response(JSON.stringify({ error: { message: "slow down" } }), { status: 429 })],
+    ["408", () => new Response(JSON.stringify({ error: { message: "timed out" } }), { status: 408 })],
     ["quota", () => new Response(JSON.stringify({ error: { code: "usage_limit_reached", message: "The usage limit has been reached" } }), { status: 429 })],
     ["unreachable", () => { throw new TypeError("fetch failed"); }],
   ];
@@ -346,7 +347,18 @@ test("no account to be had, every account at its limit, a server error, or no ro
     const error = await chat({ model: "gpt-6.1-sol", messages: [], tools: [], timeoutMs: 3_000 }).then(() => null, (thrown) => thrown);
     assert.ok(error instanceof ModelUnavailable, `${name}: ${error}`);
     assert.equal(calls, 2, `${name}: asked again once before giving up`);
+    // The log says why in the code's terms: a call that got no answer isn't a 502 that came back, and a quota is named.
+    const said = { unreachable: "ModelUnavailable, no answer (TypeError)", quota: "ModelUnavailable, quota usage_limit_reached" }[name] ?? `ModelUnavailable, status ${name}`;
+    assert.equal(told(error), said, name);
   }
+  // A quota code on a status that isn't retried is still an account at its limit, read from the error's own message.
+  let calls = 0;
+  const fetchImpl = (async () => { calls += 1; return new Response(JSON.stringify({ error: { code: "usage_not_included", message: "Not in this plan" } }), { status: 403 }); }) as unknown as typeof fetch;
+  const chat = createChat({ apiKey: "grant", baseUrl: "http://127.0.0.1:9/openai", api: "responses", effort: null, usage: emptyUsage(), fetchImpl });
+  const quota = await chat({ model: "gpt-6.1-sol", messages: [], tools: [], timeoutMs: 3_000 }).then(() => null, (thrown) => thrown);
+  assert.ok(quota instanceof ModelUnavailable, String(quota));
+  assert.equal(calls, 1, "a 403 isn't asked again");
+  assert.equal(told(quota), "ModelUnavailable, quota usage_not_included");
 });
 
 test("a request the API refuses for itself stays a ModelError, and isn't asked again", async () => {
@@ -405,6 +417,7 @@ test("the Responses API's default transport is node:http, which waits for a slow
     const started = Date.now();
     const error = await chat({ model: "slow", messages: [], tools: [], timeoutMs: 1_200 }).then(() => null, (thrown) => thrown);
     assert.ok(error instanceof ModelUnavailable, String(error));
+    assert.equal(told(error), "ModelUnavailable, no answer (AbortError)", "said by the class of what ended it, the signal's abort");
     assert.ok(slowArrived, "the slow request reached the server, so what ended it was the signal, not a failed connection");
     assert.ok(Date.now() - started < 30_000, "ended on the signal, not the server's minute");
   } finally {
@@ -468,6 +481,8 @@ test("a Responses reply that declines with no call is a refusal, a failed reply'
   const failed = (code: string) => ({ id: "r", status: "failed", error: { code }, output: [] });
   await assert.rejects(ask(respondingWith(200, failed("invalid_prompt"))), (error: unknown) => error instanceof ModelError && !(error instanceof ModelUnavailable) && error.status === 400, "a failure the request causes isn't asked again");
   await assert.rejects(ask(respondingWith(200, { id: "r", status: "failed", error: { code: "invalid_prompt" } })), (error: unknown) => error instanceof ModelError && !(error instanceof ModelUnavailable) && error.status === 400, "a failed reply with no output is classed by its code too");
+  // A failed reply naming a quota is an account at its limit, said by its code alone: its status, 400, is made up.
+  await assert.rejects(ask(respondingWith(200, failed("usage_limit_reached"))), (error: unknown) => error instanceof ModelUnavailable && told(error) === "ModelUnavailable, quota usage_limit_reached");
   const reply = await ask(respondingWith(200, { id: "r", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "{}" }] }] }));
   assert.equal(reply.contextTokens, undefined, "no usage, no size, so the loop measures the conversation itself");
   const empty = await ask(respondingWith(200, { id: "r", usage: {}, output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "{}" }] }] }));
@@ -480,4 +495,26 @@ test("a reply with an empty usage carries no size on every API, so the loop meas
   const anthropicFetch = (async () => new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }], usage: {} }))) as unknown as typeof fetch;
   const anthropicReply = await createChat({ apiKey: "key", baseUrl: "https://example.test", api: "anthropic", effort: null, usage: emptyUsage(), fetchImpl: anthropicFetch })({ model: "claude", messages: [{ role: "user", content: "hi" }], tools: [], timeoutMs: 5_000 });
   assert.equal(anthropicReply.contextTokens, undefined, "Anthropic Messages");
+});
+
+test("no file on the review shape's model route spells an error's own message (error.message, error?.message, a cast's .message, String(error) or ${error}), which told() stands in for", async () => {
+  // `${reason}` isn't read for: `reason` there holds told()'s answer.
+  // The reader's own files (src/review.ts, src/fit.ts) hold nothing back and keep a provider's body; llm.ts reads it.
+  // A spelling through another name gets past this; the redaction tests in shape.test.ts and agent.test.ts run the code.
+  // main.ts's escaped() writes what escapes every catch with its stack, which holds its message, to the shape's trace,
+  // sealed with its run, and says only its class on the job's log (tests/main.test.ts).
+  const { readdir, readFile } = await import("node:fs/promises");
+  const shape = (await readdir(new URL("../src/shape/", import.meta.url))).filter((name) => name.endsWith(".ts")).map((name) => `shape/${name}`);
+  for (const file of ["agent.ts", "main.ts", ...shape]) {
+    const text = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");
+    assert.doesNotMatch(text, /\b(error|reason|err|e)\??\.message\b|\((error|reason|err|e) as Error\)\.message|String\((error|reason|err|e)\)|\$\{(error|err|e)\}/, file);
+  }
+});
+
+test("a log is told a model error by its kind and status, a refusal by its category, and anything else by its message", () => {
+  assert.equal(told(new ModelError(400, "model API returned 400: the request quoted back")), "ModelError, status 400");
+  assert.equal(told(new ModelUnavailable(503, "model API returned 503: the request quoted back")), "ModelUnavailable, status 503");
+  assert.equal(told(new ModelRefused(400, "cyber_policy")), "Refused by the provider's safety classifier (category: cyber_policy).");
+  assert.equal(told(new Error("ran out of time before submitting")), "ran out of time before submitting");
+  assert.equal(told("plain"), "plain");
 });

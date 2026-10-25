@@ -16,7 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Finding } from "../action/comments.ts";
-import type { EvalCase, Expectation, ReviewRef } from "./lib.ts";
+import { actionReviewNamed, type EvalCase, type Expectation, type ReviewRef } from "./lib.ts";
 
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -29,6 +29,8 @@ interface ActionReview {
   /** The full id of the commit the review names. */
   commit: string;
   model?: string;
+  /** A review by the review shape, which saves its findings only in its sealed run. */
+  shape: boolean;
 }
 
 /** The action's review of this pull request: the one named, or the latest. Null when there is none. */
@@ -40,9 +42,9 @@ async function actionReview(repo: string, pr: number, id?: string): Promise<Acti
     if (id) throw new Error(`review ${id} is not a review by the action on ${repo}#${pr}`);
     return null;
   }
-  const named = /Reviewed commit ([0-9a-f]{7,40}) with ([^\s]+?)\.?(?:\s|$)/.exec(review.body);
-  const commit = named ? (await gh("api", `repos/${repo}/commits/${named[1]}`, "--jq", ".sha")).trim() : "";
-  return { id: review.id, url: review.html_url, submittedAt: review.submitted_at, commit, ...(named?.[2] ? { model: named[2] } : {}) };
+  const named = actionReviewNamed(review.body);
+  const commit = named.commit ? (await gh("api", `repos/${repo}/commits/${named.commit}`, "--jq", ".sha")).trim() : "";
+  return { id: review.id, url: review.html_url, submittedAt: review.submitted_at, commit, shape: named.shape, ...(named.model ? { model: named.model } : {}) };
 }
 
 /**
@@ -75,6 +77,8 @@ const pr = Number(parsed[2]);
 const option = (name: string): string | undefined => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined);
 const detailsPath = option("--details");
 const review = await actionReview(repo, pr, option("--review"));
+// The findings file found for a shape review would be an older review's, the reader's: say so rather than import it.
+if (review?.shape && !detailsPath) throw new Error(`review ${review.id} on ${repo}#${pr} is the review shape's, which saves no findings file for this script; give --review a review by the reader, or --details a findings file`);
 /** The commit that was reviewed. The review names it; --head overrides that. */
 const head = option("--head") ?? (review?.commit || undefined);
 

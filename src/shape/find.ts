@@ -5,10 +5,10 @@
 // of a shell in a scratch copy. A Sol call that doesn't answer stops the review, with every answer kept, and haiku
 // never reads in Sol's place.
 import { runAgent } from "../agent.ts";
-import type { Chat } from "../llm.ts";
+import { told, type Chat } from "../llm.ts";
 import { UNTRUSTED } from "../prompts.ts";
 import { changeTextTool, readTools, safeRelativePath, type ChangeTexts, type ReadRecord, type ToolDefinition, type Workspace } from "../tools.ts";
-import { HAND_IN_TURNS, KINDS, SEVERITIES, type Finding, type Kind, type Place, type Severity } from "./types.ts";
+import { entryHunks, entryOf, HAND_IN_TURNS, KINDS, SEVERITIES, type Finding, type Hunk, type Kind, type Place, type Severity } from "./types.ts";
 import type { Lens, Task } from "./plan.ts";
 
 export const FIND_SOURCE = { name: "workflow:review-find", blob: "0a5061dd510ab2e16b9f90b649b1255bf63156f8" };
@@ -118,6 +118,8 @@ export const foundTool: ToolDefinition = {
 export interface ChangeBrief {
   /** The diff lines (as read_diff numbers them) each changed file's part of the diff spans. */
   diffLines: Map<string, [number, number]>;
+  /** Each changed file's hunks, which point a reader of part of a file to the diff lines that change it. */
+  hunks: Map<string, Hunk[]>;
   title: string;
   /** The description and commit messages, which the finders read with read_change_text: the prompt gives their size. */
   description: string;
@@ -135,19 +137,22 @@ function lensText(ids: string[], lenses: Record<string, Lens>): string {
   return ids.map((id) => `**${lenses[id]!.title}**\n${lenses[id]!.lookFor.trim()}`).join("\n\n");
 }
 
-/** A files or tests entry is a path, or path:from-to for part of a file too big for one slice. */
-const pathOf = (entry: string): string => entry.replace(/:[0-9]+-[0-9]+$/, "");
+const pathOf = (entry: string): string => entryOf(entry).path;
 function fileText(entry: string): string {
-  const range = entry.match(/^(.*):([0-9]+)-([0-9]+)$/);
-  return range ? `${range[1]} (lines ${range[2]}–${range[3]})` : entry;
+  const { path, range } = entryOf(entry);
+  return range ? `${path} (lines ${range[0]}–${range[1]})` : entry;
 }
 const filesText = (entries: string[]): string => entries.map(fileText).join(", ");
 const purposeText = (purpose: string | undefined): string => purpose?.trim() ? ` Responsibility to check against the code: ${purpose.trim().replace(/([^.!?])$/, "$1.")}` : "";
 
+/** Where read_diff shows what changed in a file, or for part of one, in the hunks that reach into that part. */
 function diffOf(change: ChangeBrief, file?: string): string {
   if (!file) return "read_diff shows the whole change";
   const lines = change.diffLines.get(pathOf(file));
-  return lines ? `read_diff lines ${lines[0]} to ${lines[1]} show what changed in it` : "the diff doesn't touch it";
+  if (!lines) return "the diff doesn't touch it";
+  if (!entryOf(file).range) return `read_diff lines ${lines[0]} to ${lines[1]} show what changed in it`;
+  const hunks = entryHunks(change.hunks, file);
+  return hunks.length ? `read_diff lines ${hunks[0]!.lines[0]} to ${hunks.at(-1)!.lines[1]} show the changes around those lines` : "no hunk of the diff reaches those lines";
 }
 
 /** What a state or question reader reads: the whole change, or in a plan of several areas, the area's files. */
@@ -175,14 +180,16 @@ export function taskBrief(task: Task, change: ChangeBrief, lenses: Record<string
     const one = files.length === 1;
     const head = one
       ? `You are reviewing one file of a code change: ${fileText(files[0]!)}. ${diffOf(change, files[0])}.${purposeText(slice.purpose)}`
-      : `You are reviewing these files of a code change: ${filesText(files)}. ${diffOf(change)}; ${files.map((file) => `for ${pathOf(file)}, ${diffOf(change, file)}`).join("; ")}.${purposeText(slice.purpose)}`;
+      : `You are reviewing these files of a code change: ${filesText(files)}. ${diffOf(change)}; ${files.map((file) => `for ${fileText(file)}, ${diffOf(change, file)}`).join("; ")}.${purposeText(slice.purpose)}`;
     return ids.length
       ? `${head} Read what ${one ? "it touches" : "they touch"} as you need to.${ids.length === 1 ? ` Review ${one ? "it" : "them"}${through}` : through}\n\n${lensText(ids, lenses)}`
       : `${head} Read what ${one ? "it touches" : "they touch"} as you need to, and report the defects you find.`;
   }
   if (slice.kind === "tests") {
     const lensed = ids.length === 1 ? " Review them through this one lens, and report the defects it shows:" : through;
-    return `You are reviewing the tests of a code change against its code. ${reachOf(change).diff}; its tests are ${filesText(slice.files ?? [])}.${purposeText(slice.purpose)}${ids.length ? `${lensed}\n\n${lensText(ids, lenses)}` : " Report the defects you find in them, and the pieces of the code no test would catch."}`;
+    // A ranged entry is sized by the hunks that reach its lines, so its brief points at them, as a files slice's does.
+    const ranged = (slice.files ?? []).filter((file) => entryOf(file).range);
+    return `You are reviewing the tests of a code change against its code. ${reachOf(change).diff}; its tests are ${filesText(slice.files ?? [])}${ranged.length ? `, and ${ranged.map((file) => `for ${fileText(file)}, ${diffOf(change, file)}`).join("; ")}` : ""}.${purposeText(slice.purpose)}${ids.length ? `${lensed}\n\n${lensText(ids, lenses)}` : " Report the defects you find in them, and the pieces of the code no test would catch."}`;
   }
   if (slice.kind === "state") {
     const reach = reachOf(change);
@@ -373,11 +380,11 @@ export async function runFind(options: FindOptions): Promise<FindOutcome> {
       };
       answers.push(answer);
       // An answer the run couldn't keep is still this run's answer; only a resume would have to ask it again.
-      await options.onAnswer(answer).catch((error: unknown) => options.log(`${caller}: its answer couldn't be kept for a resume: ${error instanceof Error ? error.message : String(error)}`));
+      await options.onAnswer(answer).catch((error: unknown) => options.log(`${caller}: its answer couldn't be kept for a resume: ${told(error)}`));
       options.log(`${caller}: ${findings.length} finding(s)${dropped ? `, ${dropped} dropped as malformed or citing no file` : ""}${report.bounded ? ", handed in at its context bound" : ""}`);
     } catch (error) {
       failed.push({ battery: battery.letter, call: call.id, error, at: Date.now() });
-      options.log(`${caller} gave no answer: ${error instanceof Error ? error.message : String(error)}`);
+      options.log(`${caller} gave no answer: ${told(error)}`);
     }
   }));
   return { answers, failed };

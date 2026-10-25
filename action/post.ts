@@ -129,7 +129,7 @@ async function optionalJson<T>(path: string | undefined): Promise<T | null> {
  * with the comment each issue got, for a record of the reviews. A failure after the post leaves the review as posted.
  */
 async function postShape(review: ShapeReview, minSeverity: Severity, maxComments: number, diff: string, outDir: string | undefined): Promise<void> {
-  const input: ShapeInput = { review, hunks: parseHunks(diff), existing: await existingComments(), settled: await settledComments(), minSeverity, maxComments };
+  const input: ShapeInput = { review, hunks: parseHunks(diff), existing: await existingComments(), settled: await settledComments(), minSeverity, maxComments, server: process.env.GITHUB_SERVER_URL?.trim() || undefined };
   const parts = quietParts(buildShapeReview(input));
   let inline = parts.comments.length > 0;
   let response = await submit(parts);

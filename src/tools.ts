@@ -63,6 +63,25 @@ export const changeTextTool: ToolDefinition = tool("read_change_text", "Read a n
   line_count: lineCount,
 });
 
+/** What has been said about a pull request outside its own text: its thread, and the repository's open issues. */
+export interface KnownTexts {
+  thread: string;
+  issues: string;
+}
+
+/** The judge's tools for KnownTexts, which name an issue already raised. Neither is a path, as with read_change_text. */
+export const knownTools: ToolDefinition[] = [
+  tool("read_known", "Read a numbered slice of the pull request's thread or of the repository's open issues, as the index in your brief numbers them.", {
+    which: { type: "string", enum: ["thread", "issues"], description: "thread, or issues." },
+    start_line: startLine,
+    line_count: lineCount,
+  }),
+  tool("search_known", "Find a literal string in the pull request's thread and the repository's open issues. Returns matching lines with which text they're in and their line numbers.", {
+    query: { type: "string", description: "The exact text to find. Not a regular expression." },
+    ignore_case: { type: "boolean" },
+  }),
+];
+
 export const readTools: ToolDefinition[] = [
   tool("read_diff", "Read a numbered slice of the pull request diff.", { start_line: startLine, line_count: lineCount }),
   tool("read_file", "Read a numbered slice of a text file as it is after the change. Line numbers match the ones findings must cite.", {
@@ -115,9 +134,14 @@ export interface ReadRecord {
   hits?: Array<{ path: string; line: number }>;
 }
 
+/** A path as the repository and its diff name it: backslashes as slashes, without a leading ./ or a trailing slash. */
+export function repositoryPath(value: string): string {
+  return value.replaceAll("\\", "/").replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+}
+
 export function safeRelativePath(value: unknown): string {
   if (typeof value !== "string" || value.includes("\0") || isAbsolute(value)) throw new Error("path must be relative");
-  const normalized = value.replaceAll("\\", "/").replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+  const normalized = repositoryPath(value);
   if (normalized.split("/").includes("..")) throw new Error("parent path segments are not allowed");
   return normalized;
 }
@@ -133,6 +157,7 @@ const SAFE_ERRORS = [
   "tool output budget is exhausted",
   "file does not exist at the base revision",
   "which is description or commit-messages",
+  "which is thread or issues",
 ];
 
 /** Errors go back to the model, so only known messages pass through; anything else could leak host details. */
@@ -155,12 +180,16 @@ export class Workspace {
   /** The pull request's description and commit messages, which read_change_text serves; none for a workspace without that tool. */
   private readonly texts: ChangeTexts | null;
 
-  constructor(repoDir: string, diffPath: string, base: string, texts: ChangeTexts | null = null) {
+  /** The thread and open issues, which read_known and search_known serve; none for a workspace without those tools. */
+  private readonly known: KnownTexts | null;
+
+  constructor(repoDir: string, diffPath: string, base: string, texts: ChangeTexts | null = null, known: KnownTexts | null = null) {
     this.repoDir = repoDir;
     this.diffPath = diffPath;
     this.base = base;
     // Served as they are numbered where they're cited: their own lines, with blank lines at the end left off.
     this.texts = texts && { description: texts.description.trimEnd(), commitMessages: texts.commitMessages.trimEnd() };
+    this.known = known;
   }
 
   private async canonicalRoot(): Promise<string> {
@@ -317,6 +346,29 @@ export class Workspace {
       const slice = numberedSlice(this.texts[cited.text], args.start_line, args.line_count);
       this.record({ tool: name, path: cited.path }, slice);
       return this.shown(slice);
+    }
+    if (name === "read_known" && this.known) {
+      const which = String(args.which);
+      if (which !== "thread" && which !== "issues") throw new Error("which is thread or issues");
+      const slice = numberedSlice(this.known[which], args.start_line, args.line_count);
+      this.record({ tool: name, path: which }, slice);
+      return this.shown(slice);
+    }
+    if (name === "search_known" && this.known) {
+      const query = args.query;
+      if (typeof query !== "string" || !query || query.length > 500) throw new Error("query is invalid");
+      const needle = args.ignore_case ? query.toLowerCase() : query;
+      const results: Array<{ which: string; line: number; text: string }> = [];
+      for (const which of ["thread", "issues"] as const) {
+        for (const [index, line] of this.known[which].split("\n").entries()) {
+          if (!(args.ignore_case ? line.toLowerCase() : line).includes(needle)) continue;
+          results.push({ which, line: index + 1, text: line.trim().slice(0, 300) });
+          if (results.length >= MAX_SEARCH_RESULTS) break;
+        }
+        if (results.length >= MAX_SEARCH_RESULTS) break;
+      }
+      this.reads.push({ tool: name, query, hits: results.map(({ which, line }) => ({ path: which, line })) });
+      return { ok: true, results, truncated: results.length >= MAX_SEARCH_RESULTS };
     }
     if (name === "list_files") {
       const files = await this.walk(await this.contained(args.path ?? ""), MAX_LIST_FILES);

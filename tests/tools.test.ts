@@ -7,8 +7,9 @@ import { test } from "node:test";
 import { Workspace, type ChangeTexts } from "../src/tools.ts";
 import { loadRules } from "../src/review.ts";
 
+// A fixture's repository reads none of the host's git configuration, whose hooks or signing would meet its commits.
 function git(cwd: string, ...args: string[]): string {
-  return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" }).trim();
+  return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).trim();
 }
 
 function fixture(texts: ChangeTexts | null = null): { workspace: Workspace; root: string } {

@@ -89,12 +89,39 @@ export class ModelError extends Error {
 }
 
 /**
+ * What a log may say of an error. A public repository's Actions log is public, and main's failed line goes there, as
+ * do all the reader's lines; a provider's error body can quote the request it refuses, which may hold what a review
+ * keeps back, so a model error is said by its kind and status alone, and a refusal by its category (its message is only that); a model that couldn't be had says why in the
+ * code's terms (`why`): the class of the error for a call that got no usable answer, or which of the code's own quota
+ * codes the provider gave, never the provider's words. Anything else is said by its message. The error's own message
+ * keeps the body, which the code reads (a rejected tool_choice, a quota code).
+ */
+export function told(error: unknown): string {
+  if (error instanceof ModelRefused) return error.message;
+  if (error instanceof ModelUnavailable && error.why) return `${error.name}, ${error.why}`;
+  if (error instanceof ModelError) return `${error.name}, status ${error.status}`;
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
  * The model can't be reached now, after the retries: no account could take the call, or every
  * one is at its limit. Asking again later can succeed, so a review stops and resumes once the
  * model serves. Responses only.
  */
 export class ModelUnavailable extends ModelError {
   override name = "ModelUnavailable";
+  /**
+   * What a log may say in place of the status, in the code's terms: "no answer" and the error's class for a call that
+   * got no usable answer, whose status, 502, is made up. Through longFetch, the Responses API's transport, a request
+   * that fails is an Error and one cut off at its time an AbortError; through a fetch passed in its place, a TypeError
+   * and a TimeoutError (Node 24.19, probed). Or the quota code, one of QUOTA_CODES, for an account at its limit, whose
+   * status may be made up too (a failed reply's 400). Empty says the status.
+   */
+  readonly why: string;
+  constructor(status: number, message: string, why = "") {
+    super(status, message);
+    this.why = why;
+  }
 }
 
 /**
@@ -425,10 +452,10 @@ export function createChat(options: ClientOptions): Chat {
   function unavailable(error: unknown): unknown {
     if (options.api !== "responses" || error instanceof ModelRefused) return error;
     // A network failure or an attempt that ran out of time is as passing as an account that couldn't be had.
-    if (!(error instanceof ModelError)) return new ModelUnavailable(502, `model API could not be reached: ${error instanceof Error ? error.message : String(error)}`);
+    if (!(error instanceof ModelError)) return new ModelUnavailable(502, `model API could not be reached: ${error instanceof Error ? error.message : String(error)}`, `no answer (${error instanceof Error ? error.name : typeof error})`);
     // Every server error that outlasts the retries is as passing as one retryable() already treats it as.
-    const quota = QUOTA_CODES.some((code) => error.message.includes(`(${code})`));
-    if (error.status >= 500 || error.status === 429 || error.status === 408 || quota) return new ModelUnavailable(error.status, error.message);
+    const quota = QUOTA_CODES.find((code) => error.message.includes(`(${code})`));
+    if (error.status >= 500 || error.status === 429 || error.status === 408 || quota) return new ModelUnavailable(error.status, error.message, quota ? `quota ${quota}` : "");
     return error;
   }
 }

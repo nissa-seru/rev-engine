@@ -12,7 +12,7 @@ After the GitHub Action has reviewed a pull request, start a case with one comma
 npm run eval:add -- owner/repo#123
 ```
 
-The command records the pull request's commits, title and description. It finds the action's latest review, or the one named with `--review <review id>`, and takes the commit that review names as the case's `head`. It downloads the findings the action saved for that review and lists them as `unlabeled`, with their lines and the review's own wording and severity under `found_by`. It also records the review under `reviews` and any commits pushed after it under `fixes`. Add `--head <commit>` to override the reviewed commit, and `--private` for a private repository, which writes the case to `evals/private/`, a folder git ignores.
+The command records the pull request's commits, title and description. It finds the action's latest review, or the one named with `--review <review id>`, and takes the commit that review names as the case's `head`. It downloads the findings the action saved for that review and lists them as `unlabeled`, with their lines and the review's own wording and severity under `found_by`. It also records the review under `reviews` and any commits pushed after it under `fixes`. The review shape (`pipeline: shape`) saves its findings only in its sealed run, so for a review of the shape the command stops, saying so, unless `--details <file>` names a findings file to list instead. Add `--head <commit>` to override the reviewed commit, and `--private` for a private repository, which writes the case to `evals/private/`, a folder git ignores.
 
 Then open the case file and label it:
 

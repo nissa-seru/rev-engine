@@ -207,6 +207,19 @@ export interface RunResult {
   decided?: number;
 }
 
+/**
+ * What a review the Action posted says of itself: the commit it read, as written (short or whole), the reader's model,
+ * and whether the review shape wrote it. A shape review's summary names its head whole in its own marker, on its last
+ * line but one, the line the Action's round step reads, so a marker quoted anywhere else isn't taken for one.
+ */
+export function actionReviewNamed(body: string): { commit: string; model?: string; shape: boolean } {
+  const marker = /^<!-- rev-engine-shape-review [A-Za-z0-9._-]+-[0-9]+ ([0-9a-f]{40}) -->$/.exec(body.split("\n").filter((line) => line.length > 0).at(-2) ?? "");
+  if (marker) return { commit: marker[1]!, shape: true };
+  // The reader's own header: "Reviewed commit <sha> with <model>, by reading the code."
+  const named = /Reviewed commit ([0-9a-f]{7,40}) with ([^\s,]+?)[.,]?(?:\s|$)/.exec(body);
+  return { commit: named?.[1] ?? "", ...(named?.[2] ? { model: named[2] } : {}), shape: false };
+}
+
 /** Ids of the expectations made from earlier decisions start with this. */
 export const EARLIER = "earlier-";
 const SUPPRESSED = new Set(["wrong", "wont_fix", "deferred"]);

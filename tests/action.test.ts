@@ -8,6 +8,8 @@ import { join } from "node:path";
 // The Action's shell steps, run as bash runs them, with GitHub's environment and the gh CLI stood in.
 const ACTION = readFileSync(new URL("../action.yml", import.meta.url), "utf8");
 const WORKFLOW = readFileSync(new URL("../.github/workflows/org-review.yml", import.meta.url), "utf8");
+/** The Action's own directory, as GITHUB_ACTION_PATH names it to its steps. */
+const ROOT = new URL("..", import.meta.url).pathname;
 
 /** The `run: |` script of the step with this name in the Action (or the given file), dedented. */
 function stepScript(name: string, source = ACTION): string {
@@ -25,6 +27,16 @@ function stepScript(name: string, source = ACTION): string {
   return body.map((line) => line.slice(strip)).join("\n");
 }
 
+/** A step's block of the Action (or the given file): from its `- name:` line to the next step's, as written. */
+function stepBlock(name: string, source = ACTION): string {
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => line.trim() === `- name: ${name}`);
+  assert.ok(start >= 0, `no step named ${name}`);
+  const indent = lines[start]!.search(/\S/);
+  const end = lines.findIndex((line, index) => index > start && line.search(/\S/) === indent && line.trim().startsWith("- "));
+  return lines.slice(start, end < 0 ? undefined : end).join("\n");
+}
+
 function runStep(name: string, env: Record<string, string>, setup?: (temp: string) => void, options: { source?: string; cwd?: string } = {}): { outputs: Record<string, string>; stdout: string; temp: string } {
   const temp = mkdtempSync(join(tmpdir(), "action-step-"));
   const output = join(temp, "github-output");
@@ -39,6 +51,16 @@ function runStep(name: string, env: Record<string, string>, setup?: (temp: strin
   return { outputs, stdout, temp };
 }
 
+/** What a step that failed printed: its stdout, which holds its ::error:: line, not the script execFileSync quotes. */
+function failedOutput(run: () => unknown): string {
+  try {
+    run();
+  } catch (error) {
+    return String((error as { stdout?: unknown }).stdout ?? "");
+  }
+  assert.fail("the step didn't fail");
+}
+
 /** A stand-in for a program on the step's PATH: a bash script run with the step's arguments. */
 function stub(temp: string, name: string, script: string): void {
   mkdirSync(join(temp, "bin"), { recursive: true });
@@ -46,22 +68,47 @@ function stub(temp: string, name: string, script: string): void {
   chmodSync(join(temp, "bin", name), 0o755);
 }
 
+/** Opens a seal with a model key, as INSTALL.md's command does, and returns the files it holds. */
+function openSealed(file: string, key: string): Record<string, string> {
+  return sealedFiles(`openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -pass env:MODEL_API_KEY -in "${file}"`, { MODEL_API_KEY: key });
+}
+
+/** The real tar, for a stand-in that writes its archive whole and then fails, as tar does when it couldn't read a file. */
+const TAR = execFileSync("bash", ["-c", "command -v tar"], { encoding: "utf8" }).trim();
+
+function failingTar(temp: string): void {
+  stub(temp, "tar", `"${TAR}" "$@"; exit 2`);
+}
+
+/** Files a sealed tar holds, opened as `open` (a shell command reading the sealed bytes on stdin) writes the tar. */
+function sealedFiles(open: string, env: Record<string, string>): Record<string, string> {
+  const dir = mkdtempSync(join(tmpdir(), "action-open-"));
+  execFileSync("bash", ["-c", `set -euo pipefail; ${open} | tar -C "${dir}" -xf -`], { env: { ...process.env, ...env } });
+  const files: Record<string, string> = {};
+  const walk = (at: string, prefix: string) => {
+    for (const name of readdirSync(at, { withFileTypes: true })) {
+      if (name.isDirectory()) walk(join(at, name.name), `${prefix}${name.name}/`);
+      else files[`${prefix}${name.name}`] = readFileSync(join(at, name.name), "utf8");
+    }
+  };
+  walk(dir, "");
+  return files;
+}
+
 test("a stopped review's answers are gathered only where GitHub lets the run write its cache", () => {
   const wrotePlan = (temp: string) => {
     mkdirSync(join(temp, "rev-engine-prime/out/shape"), { recursive: true });
     writeFileSync(join(temp, "rev-engine-prime/out/shape/shape-plan.json"), "{}");
   };
-  const cases: Array<[string, string, Record<string, string>]> = [
-    ["", "workflow_dispatch", { kept: "true" }],
-    ["", "pull_request_target", { readonly: "true" }],
-    ["", "issue_comment", { readonly: "true" }],
-    ["write", "issue_comment", { kept: "true" }],
-    ["write-only", "pull_request_target", { kept: "true" }],
-    ["read", "workflow_dispatch", { readonly: "true" }],
-    ["none", "workflow_dispatch", { readonly: "true" }],
+  // A run step never sees the runner's ACTIONS_CACHE_MODE, so the event alone decides.
+  const cases: Array<[string, Record<string, string>]> = [
+    ["workflow_dispatch", { kept: "true" }],
+    ["pull_request_target", { readonly: "true" }],
+    ["issue_comment", { readonly: "true" }],
+    ["pull_request", { readonly: "true" }],
   ];
-  for (const [mode, event, expected] of cases) {
-    assert.deepEqual(runStep("Gather a stopped review's answers", { ACTIONS_CACHE_MODE: mode, GITHUB_EVENT_NAME: event }, wrotePlan).outputs, expected, `${mode || "unset"} on ${event}`);
+  for (const [event, expected] of cases) {
+    assert.deepEqual(runStep("Gather a stopped review's answers", { GITHUB_EVENT_NAME: event, SEAL_KEY: "model-key", GITHUB_ACTION_PATH: ROOT }, wrotePlan).outputs, expected, event);
   }
   assert.deepEqual(runStep("Gather a stopped review's answers", { GITHUB_EVENT_NAME: "workflow_dispatch" }).outputs, {}, "a run that wrote no plan keeps nothing new");
   const restoredOnly = (temp: string) => {
@@ -70,14 +117,19 @@ test("a stopped review's answers are gathered only where GitHub lets the run wri
   };
   assert.deepEqual(runStep("Gather a stopped review's answers", { GITHUB_EVENT_NAME: "pull_request_target" }, restoredOnly).outputs, {}, "a restored plan with no new one is neither kept again nor blamed on the cache");
   // What an earlier run kept was restored to the same place: the new answers replace it whole.
-  const { temp } = runStep("Gather a stopped review's answers", { GITHUB_EVENT_NAME: "workflow_dispatch" }, (temp) => {
+  const { temp } = runStep("Gather a stopped review's answers", { GITHUB_EVENT_NAME: "workflow_dispatch", SEAL_KEY: "model-key", GITHUB_ACTION_PATH: ROOT }, (temp) => {
     wrotePlan(temp);
     restoredOnly(temp);
     writeFileSync(join(temp, "rev-engine-prime/kept/shape-plan.json"), "stale");
     writeFileSync(join(temp, "rev-engine-prime/kept/stale-answer.json"), "stale");
   });
-  assert.deepEqual(readdirSync(join(temp, "rev-engine-prime/kept")), ["shape-plan.json"], "nothing restored is left beside the new answers");
-  assert.equal(readFileSync(join(temp, "rev-engine-prime/kept/shape-plan.json"), "utf8"), "{}", "the new plan is what's kept");
+  assert.deepEqual(readdirSync(join(temp, "rev-engine-prime/kept")), ["kept.tar.enc"], "only the sealed answers are kept, nothing restored beside them");
+  assert.deepEqual(openSealed(join(temp, "rev-engine-prime/kept/kept.tar.enc"), "model-key"), { "shape-plan.json": "{}" }, "sealed with the model key: the new plan is what's kept");
+  assert.throws(() => runStep("Gather a stopped review's answers", { GITHUB_EVENT_NAME: "workflow_dispatch", SEAL_KEY: "model-key", GITHUB_ACTION_PATH: ROOT }, (temp) => {
+    wrotePlan(temp);
+    failingTar(temp);
+  }), "answers tar couldn't read whole aren't kept (pipefail)");
+  assert.throws(() => runStep("Gather a stopped review's answers", { GITHUB_EVENT_NAME: "workflow_dispatch", SEAL_KEY: "", GITHUB_ACTION_PATH: ROOT }, wrotePlan), "no key to seal with fails the step rather than keeping the answers in the clear");
 });
 
 test("the round is read from a bot summary's own marker line only, in base 10", () => {
@@ -132,7 +184,7 @@ test("every shell step of the Action and the shared workflow parses as bash", ()
 test("the stop comment says what was kept, and why not when GitHub's cache was the reason", () => {
   const said = (env: Record<string, string>) => {
     let body = "";
-    runStep("Say that the review stopped", { REPO: "o/r", NUMBER: "7", RUN: "https://x/run", DEFAULT_BRANCH: "main", GITHUB_REF: "refs/heads/main", GH_TOKEN: "t", CATEGORY: "", KEPT: "", READONLY: "", ...env }, (temp) => {
+    runStep("Say that the review stopped", { REPO: "o/r", NUMBER: "7", RUN: "https://x/run", DEFAULT_BRANCH: "main", GITHUB_REF: "refs/heads/main", GH_TOKEN: "t", CATEGORY: "", KEPT: "", READONLY: "", EVENT_NAME: "pull_request_target", OFF_LABEL: "", COMMAND: "/review", ...env }, (temp) => {
       mkdirSync(join(temp, "bin"), { recursive: true });
       writeFileSync(join(temp, "bin/gh"), `#!/bin/bash\nwhile [ "$1" != --body ]; do shift; done\nprintf '%s' "$2" > "${join(temp, "body")}"\n`);
       chmodSync(join(temp, "bin/gh"), 0o755);
@@ -140,11 +192,35 @@ test("the stop comment says what was kept, and why not when GitHub's cache was t
     });
     return readFileSync(body, "utf8");
   };
-  assert.match(said({ STOP: "sol-unavailable", KEPT: "true" }), /It keeps what it has read/);
-  assert.match(said({ STOP: "time", READONLY: "true" }), /GitHub's cache didn't let this run keep what it read/);
-  assert.doesNotMatch(said({ STOP: "time" }), /GitHub's cache/, "nothing to keep is no cache's doing");
+  // actions/cache's save warns and succeeds when the cache refuses it, so what was kept is said as asked of the cache, with where to look.
+  assert.match(said({ STOP: "sol-unavailable", KEPT: "true" }), /It asked GitHub's cache to keep what it has read \(the run's log says if the cache refused\)/);
+  assert.match(said({ STOP: "time", READONLY: "true" }), /This run kept nothing for a later run to go on from: only a manual run keeps a stopped review's answers\./);
+  assert.doesNotMatch(said({ STOP: "time" }), /GitHub's cache|kept nothing/, "nothing to keep is no cache's doing");
+  // The command the caller configured, wherever the notice names one.
+  const configured = said({ STOP: "time", KEPT: "true", COMMAND: "/check" });
+  assert.match(configured, /which a \/check comment from someone with write access starts/);
+  assert.doesNotMatch(configured, /\/review/);
+  assert.match(said({ STOP: "refused", CATEGORY: "cyber_policy", COMMAND: "/check" }), /a \/check comment may meet the same refusal/);
+  assert.match(said({ STOP: "time", COMMAND: "/check" }), /which a \/check comment from someone with write access starts, goes on from what an earlier run of it kept/, "and with nothing kept");
   assert.match(said({ STOP: "sol-unavailable", KEPT: "true", GITHUB_REF: "refs/heads/dev" }), /a later manual run of this head on dev; a \/review comment runs on the default branch, where what this run kept isn't, and goes on from what a run there kept, if any, or reads it from the start\./);
-  assert.match(said({ STOP: "refused", CATEGORY: "cyber_policy" }), /refused one of its calls \(category: cyber_policy\)\. It won't go on by itself, and a \/review may meet the same refusal\./);
+  assert.match(said({ STOP: "refused", CATEGORY: "cyber_policy" }), /refused one of its calls \(category: cyber_policy\)\. It won't go on by itself, and a \/review comment may meet the same refusal\./);
+  assert.ok(said({ STOP: "time" }).endsWith("The run: https://x/run\n\n<!-- rev-engine-prime -->"), "the marker tells a later review it's this Action's own post");
+  // The off label put on meanwhile keeps the notice off the thread, as it keeps the review, unless a comment asked.
+  const labelled = (event: string, labels: string, label = "no-automated-review") => runStep("Say that the review stopped", { REPO: "o/r", NUMBER: "7", RUN: "https://x/run", DEFAULT_BRANCH: "main", GITHUB_REF: "refs/heads/main", GH_TOKEN: "t", CATEGORY: "", KEPT: "", READONLY: "", STOP: "time", EVENT_NAME: event, OFF_LABEL: label, COMMAND: "/review" }, (temp) => {
+    stub(temp, "gh", `if [ "$1" = api ]; then ${labels}; exit; fi\nwhile [ "$1" != --body ]; do shift; done\nprintf '%s' "$2" > "${join(temp, "body")}"`);
+  });
+  const quiet = labelled("pull_request_target", "printf '%s\\n' bug no-automated-review");
+  assert.ok(!existsSync(join(quiet.temp, "body")));
+  assert.match(quiet.stdout, /::notice::Not posted: pull request 7 now carries the label no-automated-review, so its review stopping isn't said there\. A comment of \/review reviews it again\./);
+  assert.ok(existsSync(join(labelled("issue_comment", "printf '%s\\n' no-automated-review").temp, "body")), "a review a comment asked for says it stopped");
+  assert.ok(existsSync(join(labelled("pull_request_target", "printf '%s\\n' no-automated-reviews").temp, "body")), "only the label itself counts");
+  assert.ok(existsSync(join(labelled("pull_request_target", "printf '%s\\n' holdx", "hold.*").temp, "body")), "a label of the caller's own naming, taken literally");
+  assert.ok(!existsSync(join(labelled("pull_request_target", "printf '%s\\n' 'hold.*'", "hold.*").temp, "body")), "and matched as itself");
+  assert.throws(() => labelled("pull_request_target", "exit 1"), "a failed label lookup fails the step rather than posting past it");
+  const workflow = runStep("Say that the review stopped", { REPO: "o/r", NUMBER: "7", RUN: "https://x/run", GH_TOKEN: "t" }, (temp) => {
+    stub(temp, "gh", `while [ "$1" != --body ]; do shift; done\nprintf '%s' "$2" > "${join(temp, "body")}"`);
+  }, { source: WORKFLOW });
+  assert.ok(readFileSync(join(workflow.temp, "body"), "utf8").endsWith("The run's log says why: https://x/run\n\n<!-- rev-engine-prime -->"), "and the shared workflow's stop notice too");
 });
 
 test("the dependencies job installs each lockfile with its own installer, and only a root with none from package.json's ranges", () => {
@@ -232,4 +308,178 @@ test("the diffs are written with paths as themselves", () => {
   const diffs = ACTION.split("\n").filter((line) => /git -C "\$repo".* diff /.test(line));
   assert.equal(diffs.length, 2);
   for (const line of diffs) assert.match(line, /-c core\.quotePath=false diff/);
+});
+
+test("the off label skips a review nobody asked for by comment, and keeps one from posting when it's put on meanwhile", () => {
+  const head = "c".repeat(40);
+  const pull = (labels: string[]) => (temp: string) => {
+    // gh as GitHub answers: the pull request, with these labels, and write access for the commenter.
+    writeFileSync(join(temp, "pull.json"), JSON.stringify({ base: { sha: "b".repeat(40) }, head: { sha: head, repo: { full_name: "o/r" } }, title: "t", body: "", labels: labels.map((name) => ({ name })) }));
+    stub(temp, "gh", `case "$2" in *collaborators*) echo write ;; *) cat "${join(temp, "pull.json")}" ;; esac`);
+  };
+  const ask = (event: string, labels: string[], extra: Record<string, string> = {}) => runStep("Check who asked", {
+    GH_TOKEN: "t", REPO: "o/r", EVENT_NAME: event, ACTOR: "ann", COMMENT: "/review", COMMENT_ON_PR: "https://api.github.com/repos/o/r/pulls/7", EVENT_NUMBER: "7",
+    INPUT_NUMBER: "", COMMAND: "/review", ALLOW_FORKS: "false", AUTHORS: "any", PIPELINE: "shape", OFF_LABEL: "no-automated-review", MODEL_API_KEY: "k", GITHUB_ACTION_PATH: ROOT, ...extra,
+  }, pull(labels));
+  const skipped = ask("pull_request_target", ["bug", "no-automated-review"]);
+  assert.equal(skipped.outputs.run, "false");
+  assert.match(skipped.stdout, /::notice::No review: pull request 7 carries the label no-automated-review; comment \/review on it to review it/);
+  assert.equal(ask("workflow_dispatch", ["no-automated-review"], { INPUT_NUMBER: "7" }).outputs.run, "false", "a dispatched run, such as a resume, is skipped too");
+  assert.equal(ask("issue_comment", ["no-automated-review"]).outputs.run, "true", "a comment asking for a review still has it");
+  assert.equal(ask("pull_request_target", ["bug"]).outputs.run, "true");
+  assert.equal(ask("pull_request_target", ["no-automated-review"], { OFF_LABEL: "" }).outputs.run, "true", "an empty off-label turns nothing off");
+  // The shape saves its run only sealed with the model key, so it doesn't start without one.
+  assert.match(failedOutput(() => ask("pull_request_target", ["bug"], { MODEL_API_KEY: "" })), /::error::The review shape needs model-api-key, which also seals what it saves, so no review runs/);
+  assert.equal(ask("pull_request_target", ["bug"], { PIPELINE: "reader", MODEL_API_KEY: "" }).outputs.run, "true", "the reader saves nothing of the kind, and needs no key");
+
+  const post = (event: string, labels: string[], label = "no-automated-review") => runStep("Post the review", {
+    GITHUB_TOKEN: "t", RB_NWO: "o/r", RB_PR_NUMBER: "7", RB_HEAD: head, SHAPE: "on", EVENT_NAME: event, OFF_LABEL: label, COMMAND: "/review", GITHUB_ACTION_PATH: "/action",
+  }, (temp) => {
+    stub(temp, "gh", `printf '%s\\n' ${labels.map((label) => `'${label}'`).join(" ")}`);
+    stub(temp, "docker", `echo posted > "${join(temp, "posted")}"`);
+  });
+  const late = post("pull_request_target", ["no-automated-review"]);
+  assert.ok(!existsSync(join(late.temp, "posted")));
+  assert.match(late.stdout, /::notice::Not posted: pull request 7 now carries the label no-automated-review\. The review's results are saved with this run, and a comment of \/review reviews it again and posts\./);
+  assert.ok(existsSync(join(post("issue_comment", ["no-automated-review"]).temp, "posted")), "a review a comment asked for posts");
+  assert.ok(existsSync(join(post("pull_request_target", ["no-automated-reviews", "bug"]).temp, "posted")), "only the label itself counts");
+  const unlabelled = runStep("Post the review", { GITHUB_TOKEN: "t", RB_NWO: "o/r", RB_PR_NUMBER: "7", RB_HEAD: head, SHAPE: "on", EVENT_NAME: "pull_request_target", OFF_LABEL: "", GITHUB_ACTION_PATH: "/action" }, (temp) => {
+    stub(temp, "gh", "exit 1");
+    stub(temp, "docker", `echo posted > "${join(temp, "posted")}"`);
+  });
+  assert.ok(existsSync(join(unlabelled.temp, "posted")), "an empty off-label holds nothing back at posting, and asks GitHub for no labels");
+  assert.ok(!existsSync(join(post("pull_request_target", ["hold.*"], "hold.*").temp, "posted")), "a label of the caller's own naming, taken literally");
+  assert.ok(existsSync(join(post("pull_request_target", ["holdx"], "hold.*").temp, "posted")), "matched as itself, not as a pattern");
+  assert.equal(ask("pull_request_target", ["skip me"], { OFF_LABEL: "skip me" }).outputs.run, "false", "the ask step reads the caller's own label");
+  assert.equal(ask("pull_request_target", ["skip-me"], { OFF_LABEL: "skip.me" }).outputs.run, "true", "as itself");
+  assert.throws(() => runStep("Post the review", { GITHUB_TOKEN: "t", RB_NWO: "o/r", RB_PR_NUMBER: "7", SHAPE: "", EVENT_NAME: "pull_request_target", OFF_LABEL: "no-automated-review", GITHUB_ACTION_PATH: "/action" }, (temp) => {
+    stub(temp, "gh", "exit 1");
+    stub(temp, "docker", `echo posted > "${join(temp, "posted")}"`);
+  }), "a failed label lookup fails the step rather than posting past it");
+});
+
+test("the shape's run is saved sealed with the model key, and opens only with it", () => {
+  const run = (key: string, out = true, step = "Seal the review shape's run") => runStep(step, { SEAL_KEY: key, GITHUB_ACTION_PATH: ROOT }, (temp) => {
+    if (!out) return;
+    mkdirSync(join(temp, "rev-engine-prime/out/shape/re-o.n-7-1/answers"), { recursive: true });
+    writeFileSync(join(temp, "rev-engine-prime/out/shape/run.json"), '{"outcome":"done"}');
+    writeFileSync(join(temp, "rev-engine-prime/out/shape/re-o.n-7-1/answers/A-t.json"), "held text");
+  });
+  const { outputs, temp } = run("model-key");
+  assert.deepEqual(outputs, { sealed: "true" });
+  const sealed = join(temp, "rev-engine-prime/sealed");
+  assert.deepEqual(readdirSync(sealed), ["shape.tar.enc"], "the upload holds the seal and nothing in the clear");
+  assert.ok(!readFileSync(join(sealed, "shape.tar.enc")).includes("held text"));
+  assert.deepEqual(openSealed(join(sealed, "shape.tar.enc"), "model-key"), { "run.json": '{"outcome":"done"}', "re-o.n-7-1/answers/A-t.json": "held text" });
+  assert.throws(() => openSealed(join(sealed, "shape.tar.enc"), "another key"), "another key doesn't open it");
+  // Each seal its own salt, which openssl writes after "Salted__" at its start: compared there, not in bytes a tar's
+  // times could make differ.
+  const other = join(run("model-key").temp, "rev-engine-prime/sealed/shape.tar.enc");
+  const start = (file: string) => readFileSync(file).subarray(0, 16);
+  assert.equal(start(join(sealed, "shape.tar.enc")).subarray(0, 8).toString("latin1"), "Salted__");
+  assert.ok(!start(join(sealed, "shape.tar.enc")).subarray(8).equals(start(other).subarray(8)), "two seals' salts differ");
+  assert.deepEqual(run("model-key", false).outputs, {}, "a review that wrote no run seals nothing, and nothing is uploaded");
+  const left = runStep("Seal the review shape's run", { SEAL_KEY: "model-key", GITHUB_ACTION_PATH: ROOT }, (temp) => {
+    mkdirSync(join(temp, "rev-engine-prime/sealed"), { recursive: true });
+    writeFileSync(join(temp, "rev-engine-prime/sealed/shape.tar.enc"), "a seal from before");
+  });
+  assert.deepEqual(left.outputs, {}, "a seal already there is no seal of this run");
+  assert.ok(!existsSync(join(left.temp, "rev-engine-prime/sealed/shape.tar.enc")));
+  assert.throws(() => run(""), "no key to seal with fails the step rather than saving the run in the clear");
+  assert.throws(() => run(" \n"), "nor does a key of whitespace alone");
+  // A secret pasted with its line end seals with the key as the model client and an opener read it, trimmed.
+  const padded = run(" model-key\n");
+  assert.deepEqual(openSealed(join(padded.temp, "rev-engine-prime/sealed/shape.tar.enc"), "model-key"), { "run.json": '{"outcome":"done"}', "re-o.n-7-1/answers/A-t.json": "held text" });
+  // After posting, the run is sealed again the same way, with what the post wrote into it, in the first seal's place.
+  const again = runStep("Seal it again with its comments", { SEAL_KEY: "model-key", GITHUB_ACTION_PATH: ROOT }, (temp) => {
+    mkdirSync(join(temp, "rev-engine-prime/out/shape/re-o.n-7-1"), { recursive: true });
+    writeFileSync(join(temp, "rev-engine-prime/out/shape/re-o.n-7-1/posted.json"), '{"I1":9001}');
+    mkdirSync(join(temp, "rev-engine-prime/sealed"), { recursive: true });
+    writeFileSync(join(temp, "rev-engine-prime/sealed/shape.tar.enc"), "the first seal");
+  });
+  assert.deepEqual(again.outputs, { sealed: "true" });
+  assert.deepEqual(readdirSync(join(again.temp, "rev-engine-prime/sealed")), ["shape.tar.enc"]);
+  assert.deepEqual(openSealed(join(again.temp, "rev-engine-prime/sealed/shape.tar.enc"), "model-key"), { "re-o.n-7-1/posted.json": '{"I1":9001}' }, "the first seal is replaced");
+  // A file tar can't read fails the step (pipefail), rather than sealing a run with it left out.
+  assert.throws(() => runStep("Seal the review shape's run", { SEAL_KEY: "model-key", GITHUB_ACTION_PATH: ROOT }, (temp) => {
+    mkdirSync(join(temp, "rev-engine-prime/out/shape"), { recursive: true });
+    writeFileSync(join(temp, "rev-engine-prime/out/shape/run.json"), "{}");
+    failingTar(temp);
+  }), "a run tar couldn't read whole isn't sealed");
+});
+
+test("what a stopped review kept opens with the model key, and anything else restored is set aside", () => {
+  const keep = (temp: string, key: string) => {
+    mkdirSync(join(temp, "rev-engine-prime/out/shape"), { recursive: true });
+    writeFileSync(join(temp, "rev-engine-prime/out/shape/shape-plan.json"), "{}");
+    mkdirSync(join(temp, "rev-engine-prime/kept"), { recursive: true });
+    execFileSync("bash", ["-c", `tar -C "${join(temp, "rev-engine-prime/out/shape")}" -cf - . | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -salt -pass env:KEPT_KEY -out "${join(temp, "rev-engine-prime/kept/kept.tar.enc")}"`], { env: { ...process.env, KEPT_KEY: key } });
+  };
+  const opened = runStep("Open a stopped review's answers", { KEPT_KEY: "model-key" }, (temp) => keep(temp, "model-key"));
+  assert.deepEqual(readdirSync(join(opened.temp, "rev-engine-prime/kept")), ["shape-plan.json"], "the answers are where the review reads them");
+  const paddedKey = runStep("Open a stopped review's answers", { KEPT_KEY: "model-key\n" }, (temp) => keep(temp, "model-key"));
+  assert.deepEqual(readdirSync(join(paddedKey.temp, "rev-engine-prime/kept")), ["shape-plan.json"], "a key with its line end opens what the trimmed key sealed");
+  assert.ok(!existsSync(join(opened.temp, "rev-engine-prime/kept.tar.enc")));
+  const wrong = runStep("Open a stopped review's answers", { KEPT_KEY: "model-key" }, (temp) => keep(temp, "another key"));
+  assert.ok(!existsSync(join(wrong.temp, "rev-engine-prime/kept")), "a seal the key doesn't open leaves nothing to resume from");
+  assert.match(wrong.stdout, /::warning::What a stopped review kept doesn't open with this repository's model key, so the review reads from the start/);
+  // A seal cut short: openssl fails at its last block while tar may still read what came before (pipefail).
+  const short = runStep("Open a stopped review's answers", { KEPT_KEY: "model-key" }, (temp) => {
+    keep(temp, "model-key");
+    const file = join(temp, "rev-engine-prime/kept/kept.tar.enc");
+    const bytes = readFileSync(file);
+    writeFileSync(file, bytes.subarray(0, bytes.length - 16));
+  });
+  assert.ok(!existsSync(join(short.temp, "rev-engine-prime/kept")), "a seal cut short leaves nothing to resume from");
+  assert.match(short.stdout, /::warning::What a stopped review kept doesn't open/);
+  const plain = runStep("Open a stopped review's answers", { KEPT_KEY: "model-key" }, (temp) => {
+    mkdirSync(join(temp, "rev-engine-prime/kept"), { recursive: true });
+    writeFileSync(join(temp, "rev-engine-prime/kept/shape-plan.json"), "{}");
+  });
+  assert.ok(!existsSync(join(plain.temp, "rev-engine-prime/kept")), "answers kept in the clear, as before sealing, aren't read");
+  assert.match(plain.stdout, /::notice::What was restored for this review isn't sealed/);
+  assert.deepEqual(runStep("Open a stopped review's answers", { KEPT_KEY: "model-key" }).stdout, "", "nothing restored, nothing to say");
+});
+
+test("each value a step reads is bound from the input or variable it stands for", () => {
+  const bound = (step: string, line: string, source = ACTION) => assert.ok(stepBlock(step, source).split("\n").some((each) => each.trim() === line), `${step}: ${line}`);
+  bound("Check who asked", "OFF_LABEL: ${{ inputs.off-label }}");
+  bound("Check who asked", "MODEL_API_KEY: ${{ inputs.model-api-key }}");
+  bound("Post the review", "OFF_LABEL: ${{ inputs.off-label }}");
+  bound("Say that the review stopped", "OFF_LABEL: ${{ inputs.off-label }}");
+  bound("Say that the review stopped", "EVENT_NAME: ${{ github.event_name }}");
+  bound("Say that the review stopped", "COMMAND: ${{ inputs.command }}");
+  bound("Post the review", "EVENT_NAME: ${{ github.event_name }}");
+  bound("Post the review", "COMMAND: ${{ inputs.command }}");
+  bound("Post the review", "GITHUB_SERVER_URL: ${{ github.server_url }}");
+  assert.match(stepScript("Post the review"), /-e GITHUB_SERVER_URL /, "the posting container is given it");
+  bound("Collect earlier decisions", "KNOWN_PATH: ${{ inputs.pipeline == 'shape' && '/work/pr/known.json' || '' }}");
+  assert.match(stepScript("Collect earlier decisions"), /-e KNOWN_PATH /, "the collector's container is given it");
+  bound("Open a stopped review's answers", "KEPT_KEY: ${{ inputs.model-api-key }}");
+  bound("Gather a stopped review's answers", "SEAL_KEY: ${{ inputs.model-api-key }}");
+  bound("Seal the review shape's run", "SEAL_KEY: ${{ inputs.model-api-key }}");
+  bound("Seal the review shape's run", "if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape' && !cancelled()");
+  bound("Save the review shape's run", "path: ${{ runner.temp }}/rev-engine-prime/sealed", ACTION);
+  bound("Save the review shape's run", "if: steps.seal.outputs.sealed == 'true' && !cancelled()");
+  bound("Seal it again with its comments", "SEAL_KEY: ${{ inputs.model-api-key }}");
+  bound("Seal it again with its comments", "if: steps.seal.outputs.sealed == 'true' && !cancelled() && (steps.post.outcome == 'success' || steps.post.outcome == 'failure')");
+  bound("Save it again with its comments", "path: ${{ runner.temp }}/rev-engine-prime/sealed");
+  bound("Save it again with its comments", "if: steps.reseal.outputs.sealed == 'true' && !cancelled()");
+  // Each attempt's saves, and each of its two, under a name of its own, never over another: upload-artifact deletes a
+  // same-named artifact before it uploads (overwrite), and without overwrite fails on the name (its v4 README).
+  bound("Save the review shape's run", "name: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.round.outputs.round }}-${{ github.run_attempt }}");
+  bound("Save it again with its comments", "name: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.round.outputs.round }}-${{ github.run_attempt }}-posted");
+  for (const step of ["Save the review shape's run", "Save it again with its comments"]) {
+    bound(step, "if-no-files-found: error");
+    assert.doesNotMatch(stepBlock(step, ACTION), /overwrite/, `${step} saves over nothing`);
+  }
+  // Posting has no status function, so it waits on success(): a failed save before it stops the post.
+  bound("Post the review", "if: steps.ask.outputs.run == 'true' && steps.review.outputs.status != '3'");
+  bound("Post the review", "id: post");
+  bound("Save the review", "if: steps.ask.outputs.run == 'true' && inputs.pipeline != 'shape' && !cancelled()");
+  // The sealed run is saved before anything is posted on the pull request, and sealed again after the review is.
+  const at = (step: string) => ACTION.indexOf(`- name: ${step}\n`);
+  assert.ok(at("Save the review shape's run") < at("Say that the review stopped") && at("Say that the review stopped") < at("Post the review") && at("Post the review") < at("Seal it again with its comments"));
+  bound("Review", "model-api-key: ${{ secrets.MODEL_API_KEY }}", WORKFLOW);
+  assert.match(ACTION, /\n  off-label:\n    description: [^\n]+\n    default: no-automated-review\n/);
 });

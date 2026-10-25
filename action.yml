@@ -12,7 +12,7 @@ inputs:
     description: The API the endpoint at model-base-url speaks, chat or anthropic, as RB_MODEL_API in docs/SETTINGS.md.
     default: ""
   model-api-key:
-    description: The key for the endpoint at model-base-url, which gets no other key. Pass it from a repository secret.
+    description: The key for the endpoint at model-base-url, which gets no other key. Pass it from a repository secret. The shape doesn't start without it, on OpenRouter too, since it also reaches Sol at sol-base-url, and seals the run the shape saves and what a stopped review keeps in GitHub's cache.
     default: ""
   github-token:
     description: Token used to read the pull request and post the review.
@@ -23,14 +23,17 @@ inputs:
   command:
     description: A comment starts a review only when it is this text, or this text followed by a space.
     default: /review
+  off-label:
+    description: A pull request carrying this label isn't reviewed unless someone comments the command. Put on while a review runs, it keeps that review from posting, and a stopped one from saying so, unless a comment asked for it. Its results are still saved. Empty for none.
+    default: no-automated-review
   model:
     description: Model that reviews and verifies, as OpenRouter names it, or as the endpoint at model-base-url does.
     default: anthropic/claude-opus-5.5
   min-severity:
-    description: The least severe findings that get a comment. One of high, medium or low. Less severe findings are listed in a collapsed section of the summary.
+    description: The least severe findings that get a comment. One of high, medium or low. Less severe findings are listed in a collapsed section of the summary. For the shape, high is its blockers and medium adds its should-fix issues; it says which of the change's own issues get a comment, and the summary lists every one either way.
     default: medium
   max-findings:
-    description: Cap on the number of findings that get a comment. Findings past the cap join the collapsed section; the shape lists every issue under its severity in the summary, as far as GitHub's size limit allows, counting what it leaves out, and as a last resort cuts the summary's tail, saying so.
+    description: Cap on the number of findings that get a comment. Findings past the cap join the collapsed section. The shape lists the change's blockers and should-fix issues open in the summary whether they get a comment or not, its minor issues folded by file, and issues in existing code (there before the change) folded apart below them, as far as GitHub's size limit allows, counting what it leaves out, and as a last resort cuts the summary's tail, saying so.
     default: "10"
   fit:
     description: Set to "on" to also say whether the change belongs in the project, judged by the goals and design the project states.
@@ -81,6 +84,8 @@ runs:
         ALLOW_FORKS: ${{ inputs.allow-forks }}
         AUTHORS: ${{ inputs.authors }}
         PIPELINE: ${{ inputs.pipeline }}
+        OFF_LABEL: ${{ inputs.off-label }}
+        MODEL_API_KEY: ${{ inputs.model-api-key }}
       run: |
         set -euo pipefail
         skip() { echo "::notice::No review: $1"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; }
@@ -110,6 +115,10 @@ runs:
         if [ "$(jq -r '.head.repo.full_name // ""' "$RUNNER_TEMP/rev-engine-prime/pull.json")" != "$REPO" ] && [ "$ALLOW_FORKS" != true ]; then
           skip "pull request $number comes from a fork and allow-forks is not set"
         fi
+        # A label turns the review off for one pull request; a comment asking for one still has it.
+        if [ "$EVENT_NAME" != issue_comment ] && [ -n "$OFF_LABEL" ] && jq -e --arg label "$OFF_LABEL" 'any(.labels[]?; .name == $label)' "$RUNNER_TEMP/rev-engine-prime/pull.json" >/dev/null; then
+          skip "pull request $number carries the label $OFF_LABEL; comment $COMMAND on it to review it"
+        fi
         base=$(jq -r .base.sha "$RUNNER_TEMP/rev-engine-prime/pull.json")
         head=$(jq -r .head.sha "$RUNNER_TEMP/rev-engine-prime/pull.json")
         [[ "$base" =~ ^[0-9a-f]{40}$ && "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::pull request $number has no base or head commit in its answer"; exit 1; }
@@ -122,6 +131,11 @@ runs:
           if grep -qxE "<!-- rev-engine-shape-review [A-Za-z0-9._-]+-[0-9]+ $head -->" <<<"$summaries"; then
             skip "a review of $head is done; comment $COMMAND on the pull request to review it again"
           fi
+        fi
+        # The shape saves what it doesn't post (security issues in code the base already has, every reader's answers)
+        # only sealed with the model key, so a review without one doesn't start: unsaved, its held issues would reach no one.
+        if [ "$PIPELINE" = shape ]; then
+          [ -n "$MODEL_API_KEY" ] || { echo "::error::The review shape needs model-api-key, which also seals what it saves, so no review runs"; exit 1; }
         fi
         { echo "run=true"; echo "number=$number"; echo "base=$base"; echo "head=$head"; } >> "$GITHUB_OUTPUT"
 
@@ -249,14 +263,41 @@ runs:
         key: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}
         restore-keys: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-
 
+    # What a stopped review kept is sealed with the model key, since a pull request's own workflow can restore the
+    # default branch's cache. Anything else restored, or a seal this key doesn't open, is set aside, and the review
+    # reads from the start.
+    - name: Open a stopped review's answers
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape'
+      shell: bash
+      env:
+        KEPT_KEY: ${{ inputs.model-api-key }}
+      run: |
+        set -euo pipefail
+        kept="$RUNNER_TEMP/rev-engine-prime/kept"; sealed="$RUNNER_TEMP/rev-engine-prime/kept.tar.enc"
+        [ -d "$kept" ] || exit 0
+        rm -f "$sealed"
+        if [ -f "$kept/kept.tar.enc" ] && [ ! -L "$kept/kept.tar.enc" ]; then mv "$kept/kept.tar.enc" "$sealed"; fi
+        rm -rf "$kept"
+        [ -f "$sealed" ] || { echo "::notice::What was restored for this review isn't sealed, so it's set aside and the review reads from the start"; exit 0; }
+        # The key without the whitespace round it, as action/seal.sh sealed with it.
+        KEPT_KEY="${KEPT_KEY#"${KEPT_KEY%%[![:space:]]*}"}"; export KEPT_KEY="${KEPT_KEY%"${KEPT_KEY##*[![:space:]]}"}"
+        mkdir "$kept"
+        if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -pass env:KEPT_KEY -in "$sealed" | tar -C "$kept" -xf - --no-same-owner --no-same-permissions; then
+          rm -rf "$kept"
+          echo "::warning::What a stopped review kept doesn't open with this repository's model key, so the review reads from the start"
+        fi
+        rm -f "$sealed"
+
     - name: Build the reviewer
       if: steps.ask.outputs.run == 'true'
       shell: bash
       run: docker build --quiet --tag rev-engine-prime:action "$GITHUB_ACTION_PATH"
 
     # The maintainer's decisions on earlier reviews of this pull request, so the review does not
-    # report decided findings again. It holds the GitHub token and no model key. A failure is
-    # logged as a warning and leaves no file, and the review then runs without earlier decisions.
+    # report decided findings again, and for the shape what others said on the thread and the
+    # repository's open issues, so its judge links an issue raised already. It holds the GitHub
+    # token and no model key. A failure is logged as a warning and leaves no file, and the review
+    # then runs without earlier decisions, or the shape without the thread and issues, saying so.
     - name: Collect earlier decisions
       if: steps.ask.outputs.run == 'true'
       shell: bash
@@ -266,11 +307,12 @@ runs:
         GITHUB_GRAPHQL_URL: ${{ github.graphql_url }}
         RB_NWO: ${{ github.repository }}
         RB_PR_NUMBER: ${{ steps.ask.outputs.number }}
+        KNOWN_PATH: ${{ inputs.pipeline == 'shape' && '/work/pr/known.json' || '' }}
       run: |
         docker run --rm --entrypoint node \
           -v "$GITHUB_ACTION_PATH/action:/agent/action:ro" \
           -v "$RUNNER_TEMP/rev-engine-prime/pr:/work/pr" \
-          -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_GRAPHQL_URL -e RB_NWO -e RB_PR_NUMBER -e PRIOR_PATH=/work/pr/prior.json -e DECISIONS_PATH=/work/pr/decisions.jsonl \
+          -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_GRAPHQL_URL -e RB_NWO -e RB_PR_NUMBER -e PRIOR_PATH=/work/pr/prior.json -e DECISIONS_PATH=/work/pr/decisions.jsonl -e KNOWN_PATH \
           rev-engine-prime:action /agent/action/collect.ts \
           || echo "::warning::Earlier decisions not collected: the collector exited with an error"
 
@@ -336,26 +378,31 @@ runs:
 
     # Every stop but a refusal keeps the answers where GitHub lets the run write its cache, so a later run of the same
     # pull request at the same head goes on from them, whether a maintainer's /review starts it or a scheduled resume of
-    # one stopped for Sol or the time limit. GitHub lets a run started by a pull request or a comment restore the
-    # default branch's cache but not write it (its cache access for low-trust triggers), so such a stop keeps nothing
-    # new, and its first resume, a manual run, goes on from what an earlier run kept, if any; the runner names the access it gives in
-    # ACTIONS_CACHE_MODE. The cache's version comes from its paths, so the answers are saved from the path they're
+    # one stopped for Sol or the time limit. GitHub lets a run started by pull_request_target or a comment restore the
+    # default branch's cache but not write it (its cache access for low-trust triggers), so the Action keeps answers
+    # only from a manual run: a stop of any other run keeps nothing new, and its first resume, a manual run, goes on
+    # from what an earlier run kept, if any. So the event decides: the runner gives the access it grants
+    # (ACTIONS_CACHE_MODE) to JavaScript and container actions alone (actions/runner, NodeScriptActionHandler.cs and
+    # ContainerActionHandler.cs), never to a run step like this one.
+    # The cache's version comes from its paths, so the answers are saved from the path they're
     # restored to. A run that stopped before it wrote its plan has nothing newer than what it restored, which stays in
     # the cache as it was, so nothing is saved.
     - name: Gather a stopped review's answers
       id: gather
       if: steps.review.outputs.status == '3' && steps.review.outputs.stop != 'refused'
       shell: bash
+      env:
+        SEAL_KEY: ${{ inputs.model-api-key }}
       run: |
         set -euo pipefail
         out="$RUNNER_TEMP/rev-engine-prime/out/shape"; kept="$RUNNER_TEMP/rev-engine-prime/kept"
         [ -f "$out/shape-plan.json" ] || exit 0
-        case "${ACTIONS_CACHE_MODE:-}" in
-          write|write-only) ;;
-          "") [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { echo "readonly=true" >> "$GITHUB_OUTPUT"; exit 0; } ;;
-          *) echo "readonly=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
-        esac
-        rm -rf "$kept" && cp -R "$out" "$kept" && echo "kept=true" >> "$GITHUB_OUTPUT"
+        [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { echo "readonly=true" >> "$GITHUB_OUTPUT"; exit 0; }
+        # Sealed with the model key (action/seal.sh), as "Open a stopped review's answers" opens it, and the seal alone
+        # is kept.
+        rm -rf "$kept"
+        bash "$GITHUB_ACTION_PATH/action/seal.sh" "$out" "$kept/kept.tar.enc"
+        echo "kept=true" >> "$GITHUB_OUTPUT"
 
     - name: Keep a stopped review's answers
       if: steps.gather.outputs.kept == 'true'
@@ -363,6 +410,32 @@ runs:
       with:
         path: ${{ runner.temp }}/rev-engine-prime/kept
         key: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    # The shape's run directories, for a record of the reviews, kept whether the review finished or stopped. They hold
+    # what the review doesn't post, so they're saved sealed (action/seal.sh) before the review is posted: a save that
+    # fails then fails the job with the review unposted, and no summary marks it done, so a later run of it isn't turned
+    # away. A stopped review's notice still says it stopped.
+    - name: Seal the review shape's run
+      id: seal
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape' && !cancelled()
+      shell: bash
+      env:
+        SEAL_KEY: ${{ inputs.model-api-key }}
+      run: |
+        set -euo pipefail
+        sealed="$RUNNER_TEMP/rev-engine-prime/sealed/shape.tar.enc"
+        bash "$GITHUB_ACTION_PATH/action/seal.sh" "$RUNNER_TEMP/rev-engine-prime/out/shape" "$sealed"
+        if [ -f "$sealed" ]; then echo "sealed=true" >> "$GITHUB_OUTPUT"; fi
+
+    # Named for its attempt too, so a re-run attempt of a round that posted nothing, which has the same round, saves
+    # beside an earlier attempt's run rather than over it.
+    - name: Save the review shape's run
+      if: steps.seal.outputs.sealed == 'true' && !cancelled()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.round.outputs.round }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/rev-engine-prime/sealed
+        if-no-files-found: error
 
     # A refusal is named by its category alone, never by what the provider said.
     - name: Say that the review stopped
@@ -378,29 +451,44 @@ runs:
         READONLY: ${{ steps.gather.outputs.readonly }}
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        EVENT_NAME: ${{ github.event_name }}
+        OFF_LABEL: ${{ inputs.off-label }}
+        COMMAND: ${{ inputs.command }}
       run: |
         set -euo pipefail
+        # The off label, put on while the review ran, keeps this notice off the thread too, as "Post the review" keeps
+        # the review; read whole first, so a failed lookup fails the step rather than posting past the label.
+        if [ "$EVENT_NAME" != issue_comment ] && [ -n "$OFF_LABEL" ]; then
+          labels=$(gh api --paginate "repos/$REPO/issues/$NUMBER/labels" --jq '.[].name')
+          if grep -qxF -- "$OFF_LABEL" <<<"$labels"; then
+            echo "::notice::Not posted: pull request $NUMBER now carries the label $OFF_LABEL, so its review stopping isn't said there. A comment of $COMMAND reviews it again."
+            exit 0
+          fi
+        fi
         # What it read is kept in GitHub's cache, which drops an entry unused for a week, or sooner when the
-        # repository's cache is full.
+        # repository's cache is full. actions/cache's save warns and succeeds when the cache refuses it, so the notice
+        # can say only that the run asked the cache to keep it, and the run's log says if it refused.
         # Only a stop that gathered answers to keep says so; one with nothing to keep (no plan written, none restored) doesn't.
-        kept="A later run of this head from the same base, which a /review comment from someone with write access starts, goes on from what an earlier run of it kept, if any, or reads it from the start."
-        if [ "${READONLY:-}" = true ]; then kept="GitHub's cache didn't let this run keep what it read (a run started by a pull request or a comment can't). A later run of this head from the same base, which a /review comment from someone with write access starts, goes on from what an earlier run of it kept, if any, or reads it from the start."; fi
-        if [ "${KEPT:-}" = true ]; then kept="It keeps what it has read for a later run of this head from the same base, which a /review comment from someone with write access starts, for as long as GitHub's cache holds it (up to a week unused)."; fi
+        kept="A later run of this head from the same base, which a $COMMAND comment from someone with write access starts, goes on from what an earlier run of it kept, if any, or reads it from the start."
+        if [ "${READONLY:-}" = true ]; then kept="This run kept nothing for a later run to go on from: only a manual run keeps a stopped review's answers. A later run of this head from the same base, which a $COMMAND comment from someone with write access starts, goes on from what an earlier run of it kept, if any, or reads it from the start."; fi
+        if [ "${KEPT:-}" = true ]; then kept="It asked GitHub's cache to keep what it has read (the run's log says if the cache refused), for a later run of this head from the same base, which a $COMMAND comment from someone with write access starts, for as long as the cache holds it (up to a week unused)."; fi
         # GitHub's cache serves a run only what its own branch or the default branch saved, so what a manual run on
         # another branch kept is that branch's.
-        if [ "${KEPT:-}" = true ] && [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then kept="It keeps what it has read, for as long as GitHub's cache holds it (up to a week unused), for a later manual run of this head on ${GITHUB_REF#refs/heads/}; a /review comment runs on the default branch, where what this run kept isn't, and goes on from what a run there kept, if any, or reads it from the start."; fi
+        if [ "${KEPT:-}" = true ] && [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then kept="It asked GitHub's cache to keep what it has read (the run's log says if the cache refused), for as long as the cache holds it (up to a week unused), for a later manual run of this head on ${GITHUB_REF#refs/heads/}; a $COMMAND comment runs on the default branch, where what this run kept isn't, and goes on from what a run there kept, if any, or reads it from the start."; fi
         case "$STOP" in
           sol-unavailable) body="This review stopped before it finished, because Sol, one of its two readers, couldn't take its calls. $kept" ;;
           time) body="This review stopped at its own time limit, set inside the job's, before it finished. $kept" ;;
-          refused) body="This review stopped: the model provider refused one of its calls (category: $CATEGORY). It won't go on by itself, and a /review may meet the same refusal." ;;
+          refused) body="This review stopped: the model provider refused one of its calls (category: $CATEGORY). It won't go on by itself, and a $COMMAND comment may meet the same refusal." ;;
           *) body="This review stopped before it finished, and won't go on by itself. $kept" ;;
         esac
-        gh pr comment "$NUMBER" --repo "$REPO" --body "$body The run: $RUN"
+        # The marker tells this Action's own posts from others' when a later review reads the thread.
+        gh pr comment "$NUMBER" --repo "$REPO" --body "$body The run: $RUN"$'\n\n<!-- rev-engine-prime -->'
 
-    # Keep the findings with their severities and kinds, so a review can later be
-    # turned into an eval case with evals/add.ts. They hold nothing the posted review does not.
+    # Keep the reader's findings with their severities and kinds, so a review can later be turned into an eval case
+    # with evals/add.ts. The reader holds nothing back on purpose, so they're saved as they are. The shape saves only its
+    # sealed run, above, since its findings file holds what a review the off label kept from posting never posted.
     - name: Save the review
-      if: steps.ask.outputs.run == 'true' && !cancelled()
+      if: steps.ask.outputs.run == 'true' && inputs.pipeline != 'shape' && !cancelled()
       uses: actions/upload-artifact@v4
       with:
         name: rev-engine-prime-pr-${{ steps.ask.outputs.number }}
@@ -410,12 +498,14 @@ runs:
     # The posting script runs in the same image so the runner needs no Node of its own.
     # It gets the GitHub token and no model key; the review above gets the model key and no GitHub token.
     - name: Post the review
+      id: post
       if: steps.ask.outputs.run == 'true' && steps.review.outputs.status != '3'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         GITHUB_API_URL: ${{ github.api_url }}
         GITHUB_GRAPHQL_URL: ${{ github.graphql_url }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
         RB_NWO: ${{ github.repository }}
         RB_PR_NUMBER: ${{ steps.ask.outputs.number }}
         RB_HEAD: ${{ steps.ask.outputs.head }}
@@ -423,25 +513,52 @@ runs:
         REVIEW_MODEL: ${{ inputs.model }}
         MIN_SEVERITY: ${{ inputs.min-severity }}
         MAX_COMMENTS: ${{ inputs.max-findings }}
+        EVENT_NAME: ${{ github.event_name }}
+        OFF_LABEL: ${{ inputs.off-label }}
+        COMMAND: ${{ inputs.command }}
       run: |
         set -euo pipefail
+        # The off label, put on while the review ran, keeps a review nobody asked for by comment from posting. Read
+        # whole first, so a failed lookup fails the step rather than posting past the label.
+        if [ "$EVENT_NAME" != issue_comment ] && [ -n "$OFF_LABEL" ]; then
+          labels=$(GH_TOKEN="$GITHUB_TOKEN" gh api --paginate "repos/$RB_NWO/issues/$RB_PR_NUMBER/labels" --jq '.[].name')
+          if grep -qxF -- "$OFF_LABEL" <<<"$labels"; then
+            echo "::notice::Not posted: pull request $RB_PR_NUMBER now carries the label $OFF_LABEL. The review's results are saved with this run, and a comment of $COMMAND reviews it again and posts."
+            exit 0
+          fi
+        fi
         # The shape's review is posted from its own result, and each area's run directory gets the comment ids.
         shape=()
         if [ -n "$SHAPE" ]; then shape=(-v "$RUNNER_TEMP/rev-engine-prime/out/shape:/work/out/shape" -e SHAPE_PATH=/work/out/shape/shape-review.json -e SHAPE_OUT=/work/out/shape); fi
         docker run --rm --entrypoint node "${shape[@]}" \
           -v "$GITHUB_ACTION_PATH/action:/agent/action:ro" \
           -v "$RUNNER_TEMP/rev-engine-prime:/work:ro" \
-          -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_GRAPHQL_URL -e RB_NWO -e RB_PR_NUMBER -e RB_HEAD -e REVIEW_MODEL -e MIN_SEVERITY -e MAX_COMMENTS \
+          -e GITHUB_TOKEN -e GITHUB_API_URL -e GITHUB_GRAPHQL_URL -e GITHUB_SERVER_URL -e RB_NWO -e RB_PR_NUMBER -e RB_HEAD -e REVIEW_MODEL -e MIN_SEVERITY -e MAX_COMMENTS \
           -e FINDINGS_PATH=/work/out/details.json -e FIT_PATH=/work/out/fit.json -e DIFF_PATH=/work/pr/diff.patch \
           rev-engine-prime:action /agent/action/post.ts
 
-    # The shape's run directories, for a record of the reviews: kept whether the review finished or stopped,
-    # after the post, which adds each comment's id.
-    - name: Save the review shape's run
-      if: steps.ask.outputs.run == 'true' && inputs.pipeline == 'shape' && !cancelled()
+    # The run again, now that posting has written the ids of its comments into it (posted.json, the first 100 as
+    # post.ts lists them), whether the post finished or failed partway. It's saved beside the first under a name of its
+    # own: with overwrite, upload-artifact deletes an artifact of the same name before it uploads (actions/upload-artifact
+    # v4, src/upload/upload-artifact.ts), so a failed upload would leave the run with none, and without it an upload under
+    # a taken name fails (its README). Each attempt's two have names of their own, so whoever collects a round takes its
+    # latest attempt's, the -posted copy over the first.
+    - name: Seal it again with its comments
+      id: reseal
+      if: steps.seal.outputs.sealed == 'true' && !cancelled() && (steps.post.outcome == 'success' || steps.post.outcome == 'failure')
+      shell: bash
+      env:
+        SEAL_KEY: ${{ inputs.model-api-key }}
+      run: |
+        set -euo pipefail
+        sealed="$RUNNER_TEMP/rev-engine-prime/sealed/shape.tar.enc"
+        bash "$GITHUB_ACTION_PATH/action/seal.sh" "$RUNNER_TEMP/rev-engine-prime/out/shape" "$sealed"
+        if [ -f "$sealed" ]; then echo "sealed=true" >> "$GITHUB_OUTPUT"; fi
+
+    - name: Save it again with its comments
+      if: steps.reseal.outputs.sealed == 'true' && !cancelled()
       uses: actions/upload-artifact@v4
       with:
-        name: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.round.outputs.round }}
-        path: ${{ runner.temp }}/rev-engine-prime/out/shape
-        if-no-files-found: ignore
-        overwrite: true
+        name: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.round.outputs.round }}-${{ github.run_attempt }}-posted
+        path: ${{ runner.temp }}/rev-engine-prime/sealed
+        if-no-files-found: error

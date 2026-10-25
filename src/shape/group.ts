@@ -2,7 +2,7 @@
 // cause and the same fix into one issue, so each defect is judged once. Ported from the review workflow's grouping
 // stage (GROUP_SOURCE), with its brief, its model pick by size and its checks.
 import { runAgent } from "../agent.ts";
-import { ModelRefused, ModelUnavailable, type Chat } from "../llm.ts";
+import { ModelRefused, ModelUnavailable, told, type Chat } from "../llm.ts";
 import type { ToolDefinition } from "../tools.ts";
 import type { Workspace } from "../tools.ts";
 import { HAND_IN_TURNS, SEVERITY_RANK, type Finding, type Issue, type Kind, type Severity } from "./types.ts";
@@ -199,7 +199,7 @@ export async function groupFindings(findings: Finding[], options: GroupOptions):
     } catch (error) {
       // The size cut is an estimate, so a small grouper that gives no grouping is asked of the large one once.
       if (stops(error)) throw error;
-      options.log(`${options.caller}: the ${model} grouper gave no grouping (${error instanceof Error ? error.message : String(error)}); asking ${options.largeModel}`);
+      options.log(`${options.caller}: the ${model} grouper gave no grouping (${told(error)}); asking ${options.largeModel}`);
       model = options.largeModel;
       await large();
     }
@@ -220,7 +220,7 @@ export async function groupFindings(findings: Finding[], options: GroupOptions):
       }
     } catch (error) {
       if (stops(error)) throw error;
-      found = { ...found, problems: [...found.problems, `the second ask, with these problems named, gave no grouping (${error instanceof Error ? error.message : String(error)})`] };
+      found = { ...found, problems: [...found.problems, `the second ask, with these problems named, gave no grouping (${told(error)})`] };
     }
   }
   // Nobody settles what is left after the second ask, so a finding still in no issue becomes an issue of its own rather than leaving the review.

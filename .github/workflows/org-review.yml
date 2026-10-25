@@ -21,7 +21,10 @@
 # secret MODEL_API_KEY.
 #
 # With the variable REVIEW_PIPELINE set to "shape", the review is the review shape (src/shape),
-# which also needs SOL_BASE_URL (the endpoint's base URL for OpenAI Responses), may take up to
+# which also needs SOL_BASE_URL (the endpoint's base URL for OpenAI Responses), seals the run it
+# saves with MODEL_API_KEY (since anyone signed in to GitHub can download a public repository's
+# artifacts, and the run holds what the review doesn't post), reads the repository's
+# open issues when the caller's permissions grant issues: read, may take up to
 # the job's six hours, and reads the head's dependencies, installed by a job of their own.
 # REVIEW_CONSUMERS optionally names public repositories that rely on this one, as owner/name
 # separated by spaces. Without REVIEW_PIPELINE, it is RevEngine's own reviewer, as before.
@@ -212,4 +215,5 @@ jobs:
           NUMBER: ${{ inputs.pr-number || github.event.pull_request.number || github.event.issue.number }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh pr comment "$NUMBER" --repo "$REPO" --body "The review run stopped before it finished, so its review may be missing or incomplete. The run's log says why: $RUN"
+          # The marker tells this workflow's own posts from others' when a later review reads the thread.
+          gh pr comment "$NUMBER" --repo "$REPO" --body "The review run stopped before it finished, so its review may be missing or incomplete. The run's log says why: $RUN"$'\n\n<!-- rev-engine-prime -->'

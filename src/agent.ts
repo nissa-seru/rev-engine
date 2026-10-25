@@ -3,7 +3,7 @@
 //
 // Using a tool for the final answer works with any model that can call tools,
 // and the arguments are checked as JSON before the loop accepts them.
-import { ModelError, ModelRefused, ModelUnavailable, type Chat, type ChatMessage } from "./llm.ts";
+import { ModelError, ModelRefused, ModelUnavailable, told, type Chat, type ChatMessage, type ToolCall } from "./llm.ts";
 import { readTools, type ToolDefinition, type Workspace } from "./tools.ts";
 
 /**
@@ -125,17 +125,6 @@ export function completeEntries(text: string): Record<string, unknown> | null {
   return entries.length ? { [list[1]!]: entries } : null;
 }
 
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/** A short label for a tool call in the log, such as "read_file src/pool.ts". */
-function label(name: string, rawArguments: string): string {
-  const args = parseObject(rawArguments);
-  const target = typeof args?.path === "string" ? args.path : typeof args?.query === "string" ? JSON.stringify(args.query) : "";
-  return `${name} ${target}`.trim().slice(0, 80);
-}
-
 /** What the model has handed in so far: whole submissions, and the complete entries of one that was cut off. */
 interface Held {
   submissions: Array<Record<string, unknown>>;
@@ -152,11 +141,11 @@ export async function runAgent(options: AgentOptions): Promise<Record<string, un
     // model that can't be reached stops the review whatever was held, as the loop rethrows them.
     if (options.onFailedTurn === "throw" || error instanceof ModelRefused || error instanceof ModelUnavailable) throw error;
     if (held.submissions.length && options.secondLook) {
-      options.log(`${options.caller ?? options.model}: second look failed, keeping the submissions so far: ${describe(error)}`);
+      options.log(`${options.caller ?? options.model}: second look failed, keeping the submissions so far: ${told(error)}`);
       return options.secondLook.combine(held.partial ? [...held.submissions, held.partial] : held.submissions);
     }
     if (!held.partial) throw error;
-    options.log(`${options.caller ?? options.model}: failed after a cut-off submission, keeping its complete entries: ${describe(error)}`);
+    options.log(`${options.caller ?? options.model}: failed after a cut-off submission, keeping its complete entries: ${told(error)}`);
     return held.partial;
   }
 }
@@ -222,7 +211,7 @@ async function loop(options: AgentOptions, held: Held): Promise<Record<string, u
         reply = await chat({ ...request, timeoutMs: Math.max(1, deadline - Date.now()) });
       } else if (!wrappingUp && !rejected && options.onFailedTurn !== "throw" && deadline - Date.now() > 10_000) {
         // A slow or failing call used up the investigation time. Ask for the submission instead of giving up.
-        log(`${who}: turn ${turn} failed (${describe(error)}); asking for the submission`);
+        log(`${who}: turn ${turn} failed (${told(error)}); asking for the submission`);
         wrapUp();
         continue;
       } else {
@@ -238,7 +227,12 @@ async function loop(options: AgentOptions, held: Held): Promise<Record<string, u
 
     const calls = reply.tool_calls ?? [];
     const elapsed = Math.round((Date.now() - started) / 1000);
-    log(`${who}: turn ${turn} at ${elapsed}s: ${calls.map((call) => label(call.function.name, call.function.arguments)).join(", ") || "text"}`);
+    // Only the names of tools it was offered, and a count of any others: the reader's log goes to a public repository's
+    // Actions log, and a call's path or search query, or a name the model made up, is the model's own text.
+    const offeredName = (call: ToolCall): boolean => tools.some((tool) => tool.function.name === call.function.name);
+    const unoffered = calls.filter((call) => !offeredName(call)).length;
+    const named = calls.filter(offeredName).map((call) => call.function.name);
+    log(`${who}: turn ${turn} at ${elapsed}s: ${[...named, ...(unoffered ? [`${unoffered} unoffered`] : [])].join(", ") || "text"}`);
 
     const submission = calls.find((call) => call.function.name === submitName);
     if (submission) {
@@ -268,8 +262,7 @@ async function loop(options: AgentOptions, held: Held): Promise<Record<string, u
     }
 
     for (const call of calls) {
-      const offered = tools.some((tool) => tool.function.name === call.function.name);
-      if (!offered) log(`${who}: called ${call.function.name.slice(0, 80)}, which it wasn't offered`);
+      const offered = offeredName(call);
       // Once asked to hand in, a run with handInTurns reads nothing more (see handInTurns).
       if (wrappingUp && options.handInTurns) {
         push({ role: "tool", tool_call_id: call.id, content: JSON.stringify({ ok: false, error: `reading has stopped; call ${submitName} now with what you have` }) });

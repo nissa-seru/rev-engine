@@ -43,6 +43,35 @@ test("runs tool calls, feeds results back, and returns the submission", async ()
   assert.equal(requests[0]!.forceTool, undefined);
 });
 
+test("logs each turn's tools by name only, never a path or a search query", async () => {
+  const { chat } = scripted([
+    { role: "assistant", content: null, tool_calls: [
+      { id: "c1", type: "function", function: { name: "read_file", arguments: '{"path":"src/secret-place.ts"}' } },
+      { id: "c2", type: "function", function: { name: "search", arguments: '{"query":"unchecked token compare"}' } },
+    ] },
+    toolCall("submit_review", '{"findings":[]}', "c3"),
+  ]);
+  const lines: string[] = [];
+  await runAgent({ ...options(chat), log: (line: string) => lines.push(line) });
+  const turn = lines.find((line) => line.includes("turn 1 at"));
+  assert.match(turn ?? "", /: read_file, search$/);
+  assert.ok(!lines.some((line) => line.includes("secret-place") || line.includes("unchecked token")), lines.join("\n"));
+  // A name it wasn't offered is model text too, and a provider's error body can quote the request: neither is logged.
+  const { chat: odd } = scripted([
+    new ModelError(500, "model API returned 500: echoed request: unchecked token compare"),
+    { role: "assistant", content: null, tool_calls: [
+      { id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } },
+      { id: "c2", type: "function", function: { name: "unchecked token compare in auth", arguments: "{}" } },
+    ] },
+    toolCall("submit_review", '{"findings":[]}', "c3"),
+  ]);
+  const said: string[] = [];
+  await runAgent({ ...options(odd), log: (line: string) => said.push(line) });
+  assert.ok(said.some((line) => line.endsWith("turn 1 failed (ModelError, status 500); asking for the submission")), said.join("\n"));
+  assert.ok(said.some((line) => /turn 2 at \d+s: read_file, 1 unoffered$/.test(line)), said.join("\n"));
+  assert.ok(!said.some((line) => line.includes("unchecked token")), said.join("\n"));
+});
+
 test("asks again when the submission is not valid JSON", async () => {
   const { chat, requests } = scripted([
     toolCall("submit_review", '{"findings":[{"file":"a.ts"'),
