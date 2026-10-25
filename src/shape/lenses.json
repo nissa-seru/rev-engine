@@ -9,7 +9,7 @@
   "title": "Each piece and the test aimed at it",
   "lookFor": "- Walk the diff piece by piece, rather than from what the change says it does: each changed condition, branch, guard, error return, value written and call site, each site of a feature placed in several, and the position of a piece whose order matters.\n- Picture each piece removed or inverted, and find the test that would then fail. A piece that matters and that no test would catch is a finding of kind \"test\". A piece whose removal would change nothing at all may be dead code, which is a finding too.\n- Check that the test you found is aimed at the piece. A test aimed elsewhere that happens to fail shows nothing about the piece's own purpose, and neither does one that never reaches the state the piece handles. A piece caught only that way is a finding.\n- Look for tests that can't reach their piece:\n  - a mock or fake standing in for it;\n  - a guard that lets the test skip its assertions;\n  - an assertion blind to the difference;\n  - a test that reads the code's own report of what it did;\n  - a test that holds the work at the first of several guards in series, which pins only that one;\n  - a refusal test whose input is invalid in some other way too, which passes whatever the rule does.\n\n  Each is a finding.",
   "name": "reference:code-review/each-piece-and-its-test",
-  "blob": "1672dcca3578f852741a2c870ba2248ae55f2674"
+  "blob": "5bcd57408121a89a0f5210cac1d380a922d6f059"
  },
  "vs-base": {
   "title": "Comparison with main",
@@ -75,7 +75,7 @@
   "title": "What a test waits for, and what its verdict means",
   "lookFor": "- For each wait in a test, such as a sleep, a timer, a polling loop or a fixed delay before an assertion: picture the machine under load. Does the test wait for the event that completes the phase the next step depends on, such as a record of the request a fake received or a completion flag, with time only as an outer bound? A fixed delay standing in for that event is a finding, since load uses it up.\n- For each time bound a test asserts, where the suite may run under a CPU quota: is it judged by one wall-clock maximum? CPU time, or a mean or percentile of lag chosen by the property, holds up under a quota, and one wall-clock maximum is a finding.\n- For each test whose verdict is that something didn't happen: does it also assert that it reached the point where it could have happened, such as the held call being entered or the state it races on existing? A test that would pass by never getting there is a finding of kind \"test\".\n- For each fake or mock of another component: does it behave the way that component's source does where the test's verdict depends on it, such as wrapping a failure the same way, or retrying the same number of times? A fake that differs there is a finding.",
   "name": "reference:code-review/what-a-test-verdict-means",
-  "blob": "2be7b39d1d0f91c1cb9c322f451d7c3594b6ba6d"
+  "blob": "9f6f20f8de386750281b1c9585acf3505c9266b3"
  },
  "text": {
   "title": "The text against the code",

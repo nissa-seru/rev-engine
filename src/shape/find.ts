@@ -11,7 +11,7 @@ import { changeTextTool, readTools, safeRelativePath, type ChangeTexts, type Rea
 import { entryHunks, entryOf, HAND_IN_TURNS, KINDS, SEVERITIES, type Finding, type Hunk, type Kind, type Place, type Severity } from "./types.ts";
 import type { Lens, Task } from "./plan.ts";
 
-export const FIND_SOURCE = { name: "workflow:review-find", blob: "0a5061dd510ab2e16b9f90b649b1255bf63156f8" };
+export const FIND_SOURCE = { name: "workflow:review-find", blob: "20fdace4d5cb9f3f4f40584b1b65e0c7c8b810bf" };
 
 /** The change's own text, which a finding may cite as a place. Finders read both with read_change_text, and their brief gives each one's length. */
 export const TEXT_FILES = ["change-text.md", "commit-messages.txt"];
@@ -72,7 +72,7 @@ export interface FindAnswer {
 
 export const SEVERITY_TEXT = [
   "- blocker: merged as is, it breaks something its users rely on, loses or corrupts data, opens a containment or credential hole, or leaves the change's stated purpose unmet;",
-  "- should-fix: a real defect or gap, with a realistic trigger, that review would ask to fix in this change, such as a missed sibling place, a piece no test aims at, or a claim that would mislead whoever acts on it;",
+  "- should-fix: a real defect or gap, with a realistic trigger, that review would ask to fix in this change, such as a missed sibling place, a requirement no test pins, or a claim that would mislead whoever acts on it;",
   "- minor: a defect with no realistic trigger, or a stale comment that would mislead whoever maintains the code.",
 ].join("\n");
 
@@ -100,7 +100,7 @@ export const foundTool: ToolDefinition = {
                 description: "Every place the defect involves, as file and line at head, or at the base for a file the change deletes. The change's own text is change-text.md or commit-messages.txt.",
                 items: { type: "object", additionalProperties: false, required: ["file", "line"], properties: { file: { type: "string" }, line: { type: "integer" } } },
               },
-              kind: { type: "string", enum: [...KINDS], description: "code: wrong behaviour; test: a piece that matters with no test that would catch it, or a test that cannot fail; text: a claim the code does not bear out, which would mislead whoever acts on it." },
+              kind: { type: "string", enum: [...KINDS], description: "code: wrong behaviour; test: a requirement or consequent the tests do not pin, or a test that cannot fail; text: a claim the code does not bear out, which would mislead whoever acts on it." },
               claim: { type: "string", description: "One sentence: what is wrong, and the mechanism that makes it so." },
               failingCase: { type: "string", description: "The input, state or sequence that shows it: what should happen, and what happens." },
               severity: { type: "string", enum: [...SEVERITIES] },
@@ -189,7 +189,7 @@ export function taskBrief(task: Task, change: ChangeBrief, lenses: Record<string
     const lensed = ids.length === 1 ? " Review them through this one lens, and report the defects it shows:" : through;
     // A ranged entry is sized by the hunks that reach its lines, so its brief points at them, as a files slice's does.
     const ranged = (slice.files ?? []).filter((file) => entryOf(file).range);
-    return `You are reviewing the tests of a code change against its code. ${reachOf(change).diff}; its tests are ${filesText(slice.files ?? [])}${ranged.length ? `, and ${ranged.map((file) => `for ${fileText(file)}, ${diffOf(change, file)}`).join("; ")}` : ""}.${purposeText(slice.purpose)}${ids.length ? `${lensed}\n\n${lensText(ids, lenses)}` : " Report the defects you find in them, and the pieces of the code no test would catch."}`;
+    return `You are reviewing the tests of a code change against its code. ${reachOf(change).diff}; its tests are ${filesText(slice.files ?? [])}${ranged.length ? `, and ${ranged.map((file) => `for ${fileText(file)}, ${diffOf(change, file)}`).join("; ")}` : ""}.${purposeText(slice.purpose)}${ids.length ? `${lensed}\n\n${lensText(ids, lenses)}` : " Report the defects you find in them, and the requirements of the code no test pins."}`;
   }
   if (slice.kind === "state") {
     const reach = reachOf(change);
