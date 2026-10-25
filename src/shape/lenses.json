@@ -9,7 +9,7 @@
   "title": "Each piece and the test aimed at it",
   "lookFor": "- Walk the diff piece by piece, rather than from what the change says it does: each changed condition, branch, guard, error return, value written and call site, each site of a feature placed in several, and the position of a piece whose order matters.\n- Picture each piece removed or inverted, and find the test that would then fail. A piece that matters and that no test would catch is a finding of kind \"test\". A piece whose removal would change nothing at all may be dead code, which is a finding too.\n- Check that the test you found is aimed at the piece. A test aimed elsewhere that happens to fail shows nothing about the piece's own purpose, and neither does one that never reaches the state the piece handles. A piece caught only that way is a finding.\n- Look for tests that can't reach their piece:\n  - a mock or fake standing in for it;\n  - a guard that lets the test skip its assertions;\n  - an assertion blind to the difference;\n  - a test that reads the code's own report of what it did;\n  - a test that holds the work at the first of several guards in series, which pins only that one;\n  - a refusal test whose input is invalid in some other way too, which passes whatever the rule does.\n\n  Each is a finding.",
   "name": "reference:code-review/each-piece-and-its-test",
-  "blob": "5bcd57408121a89a0f5210cac1d380a922d6f059"
+  "blob": "b6eaedbb7c32b61c6b43b439fd99344c0a4aa30f"
  },
  "vs-base": {
   "title": "Comparison with main",

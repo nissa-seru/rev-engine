@@ -46,6 +46,11 @@ export interface JudgeVerdict {
   security: boolean;
   /** Where the defect is already named: "description", or a thread comment's or an open issue's URL; "" for nowhere. */
   knownAt: string;
+  /**
+   * For one the change's own text names (knownAt "description"): whether that text gives a reason for leaving it that
+   * holds by the judge's reading, so it doesn't weigh in the review's advice. false otherwise.
+   */
+  reasonHolds: boolean;
   /** The issue as its reader is told it: what goes wrong, when, and where, by reading. */
   text: string;
   /**
@@ -143,7 +148,7 @@ const verdictsTool: ToolDefinition = {
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["issue", "verdict", "notRealKind", "severity", "why", "evidence", "confidence", "repeatOf", "exceptionHolds", "origin", "security", "knownAt", "text", "confirm"],
+            required: ["issue", "verdict", "notRealKind", "severity", "why", "evidence", "confidence", "repeatOf", "exceptionHolds", "origin", "security", "knownAt", "reasonHolds", "text", "confirm"],
             properties: {
               issue: { type: "string", description: "The issue id, as given, such as I3." },
               verdict: { type: "string", enum: ["real", "not-real", "unsure"], description: "real, not-real or unsure, as the brief defines them." },
@@ -161,6 +166,7 @@ const verdictsTool: ToolDefinition = {
               origin: { type: "string", enum: ["change", "base"], description: "change: the defect is in what the change adds or alters, or the change makes it reachable. base: it is in code the base already has, and would be there without the change." },
               security: { type: "boolean", description: "Whether fixing it would be a security fix, as the brief defines one." },
               knownAt: { type: "string", description: "Where the defect is already named: 'description' for the change's own description or commit messages, or the URL of the thread comment or open issue that names it, as the index gives it; '' when nothing names it." },
+              reasonHolds: { type: "boolean", description: "When knownAt is 'description': whether the change's own text gives a reason for leaving it that holds by your reading. false otherwise." },
               text: { type: "string", description: "For real or unsure: the issue as a maintainer reads it, as the brief says. '' for not-real." },
               confirm: { type: "string", description: "For a real or unsure issue, whatever its grade: the run that would confirm it. '' otherwise." },
             },
@@ -233,12 +239,15 @@ ${context.laterRound ? "This review reads only what changed since an earlier rev
 Give each real or unsure issue a severity, judged against the code as it is used, by the same definitions the review's readers graded by:
 ${SEVERITY_TEXT}
 
+How much a missing test matters follows what the project's own rules ask of tests. Where they ask only that a change's tests fail on the unfixed code, or that what wasn't tested be said, a behaviour the change adds with no test, which the change's own text doesn't name as untested, is a minor gap to name; a branch, case or count of a tested piece with no test of its own isn't an issue (not-real, an ask the project doesn't make); and a test the change adds that couldn't fail on the unfixed code is real.
+
 ## What else each verdict says
 
 - **origin:** change when the defect is in what the change adds or alters, or when the change newly makes an older defect reachable or worse; base when it is in code the base already has and would be there, as bad, without the change. Read the base with read_base_file to tell.
 - **security:** true when fixing it would close a way for someone to read, change or run what they shouldn't, or to stop or exhaust the program with input it accepts from others: injection, broken authentication or authorization, exposed secrets or credentials, a path or sandbox escape, unbounded use of memory, disk or time from outside input. When you can't tell, true.
 - **knownAt:** where the defect is already named: description when the change's own description or commit messages name it${context.knownIndex ? ", or the URL of the thread item or open issue that names it, from the index below" : ""}. Name a place only when it names this defect, the same wrong outcome from the same cause, not when it only touches the same code. '' when nothing names it.
-- **text:** for a real or unsure issue, the issue as a maintainer reads it, in at most about 60 words: what goes wrong, in which case, and where, each place as path:line at head (at the base for a file the change deletes). Don't restate the title, and don't tell the same thing twice. Nothing was run: say what you found by reading as reading, such as "by reading, no test checks that the entry is cleared", never as a run's result, such as "the suite passes" or "removing it leaves the tests passing". '' for not-real.
+- **reasonHolds:** when knownAt is description: true when the description or commit messages give a reason for leaving it as it is, such as a known limit, out of scope, not worth fixing here or a follow-up, and that reason holds by your reading; false when they give none, or the reason doesn't hold, and then the text says why it doesn't. false when knownAt isn't description.
+- **text:** for a real or unsure issue, the issue as a maintainer reads it, in at most about 60 words: what goes wrong, in which case, and where, each place as path:line at head (at the base for a file the change deletes). Don't restate the title, and don't tell the same thing twice. Nothing was run: say what you found by reading as reading, such as "by reading, no test checks that the entry is cleared", never as a run's result, such as "the suite passes" or "removing it leaves the tests passing", and a change nobody made as what it would do, such as "removing the condition would give ['a', 'b']", never "gives". A maintainer reads this text on the pull request, so cite a place in a dependency by its package and installed version (its package.json in node_modules says which), such as "context-manager 0.22.0's src/message-store.ts:606", and the change's own text as "the description" or "the commit message", quoting the sentence, never as change-text.md or commit-messages.txt. '' for not-real.
 - **confirm:** for a real or unsure issue, whatever its grade, since a later check may raise it, the run that would confirm it, in a sentence: the input or test to run and what to look for. '' otherwise.
 
 ${prior?.entries.length ? `${priorDecisionsVerifierSection(prior).replaceAll("finding you check", "issue you judge").replaceAll("set repeat_of to null", "set repeatOf to ''").replaceAll("repeat_of", "repeatOf").replaceAll("exception_holds", "exceptionHolds")}\n\n` : "There are no earlier decisions on this pull request, so give every issue repeatOf '' and exceptionHolds false.\n\n"}Hand in your verdicts by calling submit_verdicts, one for each issue: ${batch.map((issue) => issue.id).join(", ")}.
@@ -331,6 +340,7 @@ export function parseVerdicts(value: Record<string, unknown>, asked: Issue[], pr
       confidence: oneOf(item.confidence, ["low", "medium", "high"] as const, "low"),
       ...(repeatOf ? { repeatOf } : {}),
       origin: oneOf(item.origin, ["change", "base"] as const, "change"), security: item.security === true,
+      reasonHolds: item.reasonHolds === true && typeof item.knownAt === "string" && item.knownAt.trim() === "description",
       knownAt: typeof item.knownAt === "string" && (item.knownAt.trim() === "description" || knownUrls.has(item.knownAt.trim())) ? item.knownAt.trim() : "",
       text: posted ? text : "", confirm: posted ? confirm : "",
     });

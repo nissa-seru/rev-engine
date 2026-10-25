@@ -13,7 +13,7 @@ import { tmpdir as tempRoot } from "node:os";
 import { join as joinPath } from "node:path";
 import { settleSeverities, severityPrompt } from "../src/shape/severity.ts";
 import { clause, entryHunks, type Finding, type Hunk, type Issue } from "../src/shape/types.ts";
-import { buildShapeReview, BODY_LIMIT, cut, markedIssue, shapeCommentBody, type ShapeReview } from "../action/shape.ts";
+import { buildShapeReview, BODY_LIMIT, cut, markedIssue, shapeCommentBody, shapeRecommendation, type ShapeReview } from "../action/shape.ts";
 import { parseHunks, quietMentions, quietParts } from "../action/comments.ts";
 
 const DIFF = `diff --git a/src/a.ts b/src/a.ts
@@ -363,7 +363,7 @@ test("a run that ends with its error asks for no partial answer", async () => {
 const posted = (id: string, severity: PostedIssue["severity"], line = 11, readers = ["A", "B"]): PostedIssue => ({
   area: "all", id, issue: id, label: "re-o.n-1-1", title: `Issue ${id}`, severity, kind: "code", verdict: "real", readers, places: [{ file: "src/a.ts", line }],
   causes: ["the cause"], consequences: ["the effect"], failingCase: "the case", why: "because",
-  origin: "change", security: false, knownAt: "", text: `What goes wrong for ${id}, by reading.`, confirm: `Run the case for ${id}.`, repeats: [],
+  origin: "change", security: false, knownAt: "", reasonHolds: false, text: `What goes wrong for ${id}, by reading.`, confirm: `Run the case for ${id}.`, repeats: [],
 });
 
 function shapeReview(issues: PostedIssue[], extra: Partial<ShapeReview> = {}): ShapeReview {
@@ -879,7 +879,7 @@ test("an issue's text and its run end with one full stop, a minor issue has no r
   const minor = shapeCommentBody({ ...posted("I2", "minor"), confirm: "a run nobody needs" });
   assert.doesNotMatch(minor, /To confirm/, "a minor issue isn't a lead for a run");
   const unsure = shapeCommentBody({ ...posted("I3", "should-fix"), verdict: "unsure", knownAt: "description" });
-  assert.match(unsure, /The judge couldn't settle it from the code, so it is listed for a maintainer to weigh\.\n\nAlready named in this pull request's description or commit messages\./);
+  assert.match(unsure, /The judge couldn't settle it from the code, so it is listed for a maintainer to weigh\.\n\nNamed in this pull request's description or commit messages, and it still weighs in the recommendation: by reading, nothing there gives a reason for leaving it that holds\./);
   assert.equal(clause(["why it fails?"]), "why it fails?", "a question keeps its own mark");
   assert.equal(clause(["a,", "b:"]), "a; b.");
   assert.deepEqual(toFinding({ ...posted("I3", "minor"), causes: ["c."], consequences: [] }, "p")?.message, "Issue I3. Cause: c. Case: the case");
@@ -1119,6 +1119,27 @@ test("the review's unread changes take every area's answers, of both batteries, 
   assert.deepEqual(review.unreadChanges, { changed: 4, unread: 1, files: [{ path: "test/a.test.ts", added: [[2, 2]], removed: [] }] });
 });
 
+test("a limit the change's own text names weighs in the advice only when no reason given there holds", () => {
+  // The judge's answer means something only for an issue the change's own text names.
+  const [named, linked] = parseVerdicts({ verdicts: [
+    { issue: "I1", verdict: "real", severity: "should-fix", ...OWN, knownAt: "description", reasonHolds: true },
+    { issue: "I2", verdict: "real", severity: "should-fix", ...OWN, knownAt: "https://github.com/o/n/issues/7", reasonHolds: true },
+  ] }, [issue("I1"), issue("I2")], null, new Set(["https://github.com/o/n/issues/7"]));
+  assert.deepEqual([named!.reasonHolds, linked!.reasonHolds], [true, false]);
+  const left = { ...posted("I1", "should-fix"), knownAt: "description", reasonHolds: true };
+  const weighs = { ...posted("I1", "should-fix"), knownAt: "description", reasonHolds: false };
+  assert.match(shapeRecommendation({ issues: [left], unjudged: [], roundOf: null, base: "b".repeat(40) }), /^\*\*Recommendation: merge\.\*\*/, "a named limit whose reason holds is the author's call");
+  assert.match(shapeRecommendation({ issues: [weighs], unjudged: [], roundOf: null, base: "b".repeat(40) }), /^\*\*Recommendation: fix here or file an issue for each, then merge\.\*\* 1 should-fix issue/, "one with no reason that holds still weighs");
+  assert.match(shapeRecommendation({ issues: [left, { ...posted("I2", "should-fix") }], unjudged: [], roundOf: null, base: "b".repeat(40) }), / 1 should-fix issue should be/, "and only the other counts");
+  const body = buildShapeReview({ review: shapeReview([left]), hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 10 }).body;
+  assert.match(body, /Named in this pull request's description or commit messages, with a reason for leaving it that holds by reading, so it doesn't weigh in the recommendation\./, "the review says which, beside the issue");
+  assert.match(body, /#### Named in this pull request \(1\)\n\n<details>\n<summary>1 issue the description or commit messages name, with a reason for leaving it that holds by reading, which doesn't weigh in the recommendation<\/summary>/, "listed apart, as information");
+  assert.doesNotMatch(body, /#### Should fix/, "not among the should-fix issues the advice counts");
+  assert.match(shapeCommentBody({ ...posted("I3", "minor"), knownAt: "description" }), /\n\nNamed in this pull request's description or commit messages\.\n/, "a minor issue, which never weighs, isn't said to weigh still");
+  assert.match(shapeCommentBody({ ...posted("I4", "should-fix"), origin: "base", knownAt: "description", reasonHolds: true }), /\n\nNamed in this pull request's description or commit messages\.\n/, "nor is existing code's");
+  assert.match(body, /Besides those this pull request names itself, below, the review found no issue in the change/);
+});
+
 test("a posted verdict without its origin, security answer, text or confirming run is asked again, and knownAt names only the description or an indexed URL", () => {
   const indexed = "https://github.com/o/n/issues/7";
   const verdicts = parseVerdicts({ verdicts: [
@@ -1302,7 +1323,7 @@ test("the severity check names a repeat only of an issue above it, and a chain o
 test("a repeat folds into the issue it repeats, which keeps the graver grade, and a security issue any judge placed in the base's code is held", () => {
   const verdict = (id: string, severity: JudgeVerdict["severity"], extra: Partial<JudgeVerdict> = {}): JudgeVerdict => ({
     issue: id, verdict: "real", notRealKind: "", severity, judgedSeverity: severity, why: "w", evidence: [], confidence: "high",
-    origin: "change", security: false, knownAt: "", text: `text ${id}`, confirm: "", ...extra,
+    origin: "change", security: false, knownAt: "", reasonHolds: false, text: `text ${id}`, confirm: "", ...extra,
   });
   const located = (key: string, file: string, line: number): Finding => ({ ...finding(key), places: [{ file, line }] });
   const area = (name: string) => ({ name, files: [], tasks: [], questions: [] });
@@ -1328,7 +1349,7 @@ test("a repeat folds into the issue it repeats, which keeps the graver grade, an
     all: [located("B:t[0]", "src/b.ts", 5), located("B:t[1]", "src/a.ts", 11), located("B:t[2]", "src/old.ts", 8), located("B:t[3]", "src/c.ts", 2), located("B:t[4]", "src/old.ts", 30), located("B:t[5]", "src/d.ts", 4), located("A:u[0]", "src/f.ts", 2), located("B:t[6]", "src/old.ts", 41), located("B:t[7]", "src/old.ts", 50)],
     grouping: { issues: [grouped("I1", "B:t[0]", "B:t[1]"), grouped("I2", "B:t[2]"), grouped("I3", "B:t[3]"), grouped("I4", "B:t[4]"), grouped("I5", "B:t[5]"), grouped("I6", "A:u[0]"), grouped("I7", "B:t[6]"), grouped("I8", "B:t[7]")], problems: [] },
     judging: { verdicts: [
-      verdict("I1", "blocker", { origin: "base", security: true, knownAt: "description", confirm: "run tests/I1" }),
+      verdict("I1", "blocker", { origin: "base", security: true, knownAt: "description", reasonHolds: true, confirm: "run tests/I1" }),
       verdict("I2", "minor", { confirm: "run tests/I2" }),
       verdict("I3", "should-fix", { security: true, confirm: "run tests/I3" }),
       verdict("I4", "minor"),
@@ -1344,7 +1365,7 @@ test("a repeat folds into the issue it repeats, which keeps the graver grade, an
   assert.deepEqual([review.held[3]!.origin, review.held[3]!.security, review.held[3]!.repeats], ["base", true, ["tests/I8"]], "held too when one judge calls it security in the change's code and the other places it, not as security, in the base's");
   const [first, , third] = review.held;
   assert.deepEqual([first!.severity, first!.verdict, first!.readers, first!.places, first!.repeats], ["blocker", "real", ["A", "B"], [{ file: "src/a.ts", line: 11 }, { file: "src/b.ts", line: 5 }], ["tests/I1"]], "the graver grade, real when either is, and each place once, its own repeats among them");
-  assert.deepEqual([first!.security, first!.origin, first!.knownAt, first!.text, first!.confirm], [true, "base", "description", "text I1", "run tests/I1"], "its own text, and the repeat's run and naming where it had none");
+  assert.deepEqual([first!.security, first!.origin, first!.knownAt, first!.reasonHolds, first!.text, first!.confirm], [true, "base", "description", true, "text I1", "run tests/I1"], "its own text, and the repeat's run, naming and the reason it gave, where it had none");
   assert.deepEqual([third!.origin, third!.security, third!.repeats, third!.text, third!.confirm], ["base", true, ["tests/I2"], "text I3", "run tests/I2"]);
   assert.deepEqual(review.issues.map((posted) => posted.id), ["core/I5", "core/I8", "core/I4", "core/I6", "core/I7", "core/I9"], "a security issue only in the change's own code posts, and so does an issue in the base's code that isn't security");
   const [own, unsure, older, either, alone, bothBase] = review.issues;

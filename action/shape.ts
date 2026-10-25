@@ -38,6 +38,8 @@ export interface PostedIssue {
   security: boolean;
   /** "description", a thread item's or an open issue's URL, or "". */
   knownAt: string;
+  /** For one the change's own text names: whether it gives a reason for leaving it that holds. Absent in a review saved before the judge said. */
+  reasonHolds?: boolean;
   text: string;
   confirm: string;
   repeats: string[];
@@ -179,7 +181,12 @@ function sentence(text: string): string {
 /** Where the issue is already named, as a sentence, or "" for nowhere. */
 function knownNote(issue: PostedIssue): string {
   if (!issue.knownAt) return "";
-  if (issue.knownAt === "description") return "Already named in this pull request's description or commit messages.";
+  if (issue.knownAt === "description") {
+    // Only the change's own blockers and should-fix issues weigh, so only they can be said to weigh still.
+    if (namedLimit(issue)) return "Named in this pull request's description or commit messages, with a reason for leaving it that holds by reading, so it doesn't weigh in the recommendation.";
+    if (issue.origin === "change" && issue.severity !== "minor") return "Named in this pull request's description or commit messages, and it still weighs in the recommendation: by reading, nothing there gives a reason for leaving it that holds.";
+    return "Named in this pull request's description or commit messages.";
+  }
   const number = /\/issues\/(\d+)$/.exec(issue.knownAt)?.[1];
   return `Already raised ${number ? `in [#${number}](${issue.knownAt})` : `[on this pull request](${issue.knownAt})`}.`;
 }
@@ -267,10 +274,16 @@ export function shapeCommentBody(issue: PostedIssue): string {
  * One line of merge advice, from the change's own issues the judge held real, in the practice of fixing in the pull
  * request or filing an issue before merging; and what it doesn't rest on: the change's issues the judge couldn't
  * settle, every issue it gave no verdict on (whose origin no judge said), and, in a later round, what the earlier review
- * raised. Issues in code the change builds on don't weigh in it.
+ * raised. Issues in code the change builds on don't weigh in it, and nor does one the change's own text names with a
+ * reason for leaving it that holds by the judge's reading.
  */
+/** A limit the change's own text names, with a reason for leaving it that holds: the author's call, not the advice's. */
+function namedLimit(issue: PostedIssue): boolean {
+  return issue.origin === "change" && issue.knownAt === "description" && issue.reasonHolds === true;
+}
+
 export function shapeRecommendation(review: Pick<ShapeReview, "issues" | "unjudged" | "roundOf" | "base">): string {
-  const own = review.issues.filter((issue) => issue.origin === "change");
+  const own = review.issues.filter((issue) => issue.origin === "change" && !namedLimit(issue));
   const real = own.filter((issue) => issue.verdict === "real");
   const blockers = real.filter((issue) => issue.severity === "blocker").length;
   const shouldFix = real.filter((issue) => issue.severity === "should-fix").length;
@@ -347,8 +360,15 @@ function chooseComments(input: ShapeInput): Built {
   return { comments, commented, repeats };
 }
 
-/** Which lists are compact: an issue's title and places, with no text. "base" is the list of issues in code the change builds on. */
-type Part = Severity | "base";
+/**
+ * Which lists are compact: an issue's title and places, with no text. "base" is the list of issues in code the change
+ * builds on, and "named" the change's own issues its text names with a reason that holds.
+ */
+type Part = Severity | "base" | "named";
+
+function partOf(issue: PostedIssue): Part {
+  return issue.origin === "base" ? "base" : namedLimit(issue) ? "named" : issue.severity;
+}
 
 /**
  * The summary, at a level of detail: full lists every issue's text, each cut at MAX_ENTRY_CHARS; compact gives each
@@ -365,12 +385,13 @@ function summary(input: ShapeInput, built: Built, links: Array<string | undefine
   if (review.dependenciesFromRanges) read.push("The head has no lockfile at its root, so its dependencies were installed from package.json's version ranges, and a dependency the readers read may be a later version than the author ran.");
   const linkOf = new Map(built.commented.map((issue, index) => [issue, links[index]]));
   const repeatOf = new Map(built.repeats.map(({ issue, earlier }) => [issue, earlier]));
-  const own = review.issues.filter((issue) => issue.origin === "change");
+  const own = review.issues.filter((issue) => issue.origin === "change" && !namedLimit(issue));
+  const named = review.issues.filter(namedLimit);
   // Each blocker and should-fix listed, the change's own and existing code's, is promised its run only when one is
   // listed and each says it: in its comment, or in its entry listed whole. An entry made compact (as every list is
   // before any is cut), one that points at an earlier comment, or one whose judge gave no run doesn't.
   const serious = review.issues.filter((issue) => issue.severity !== "minor");
-  const runs = serious.length > 0 && serious.every((issue) => issue.confirm && !repeatOf.has(issue) && (linkOf.has(issue) || !compact.has(issue.origin === "base" ? "base" : issue.severity)));
+  const runs = serious.length > 0 && serious.every((issue) => issue.confirm && !repeatOf.has(issue) && (linkOf.has(issue) || !compact.has(partOf(issue))));
   const sections = [
     `### Automated review\n\n${recommend}\n\nReviewed commit ${review.head.slice(0, 7)}${since} by reading the code, in four stages: a plan by ${review.models.planner}; two readers on every task of it, ${review.models.batteryA} and ${review.models.batteryB}${review.shortfall.length ? ` (${review.models.batteryB} gave no answer on ${count(review.shortfall.length, "task")}, which ${review.models.batteryA} alone read)` : ""}; their findings grouped into issues; and a judge, ${review.models.judge}, that tried to refute each issue. Nothing was run, so each issue is a lead from reading${runs ? ", and each blocker or should-fix says the run that would confirm it" : ""}.\n\n${read.join(" ")}`,
   ];
@@ -379,7 +400,7 @@ function summary(input: ShapeInput, built: Built, links: Array<string | undefine
     if (issues.length > keep) lines.push(`- and ${count(issues.length - keep, "more issue")}, in the run this review saved, sealed with this review's model key.`);
     return lines.join("\n");
   };
-  if (!own.length) sections.push("#### Issues\n\nThe review found no issue in the change that its judge held to be real.");
+  if (!own.length) sections.push(`#### Issues\n\n${named.length ? "Besides those this pull request names itself, below, the" : "The"} review found no issue in the change that its judge held to be real.`);
   for (const severity of ["blocker", "should-fix"] as const) {
     const issues = own.filter((issue) => issue.severity === severity);
     if (issues.length) sections.push(`#### ${HEADING[severity]} (${issues.length})\n\n${list(issues, severity)}`);
@@ -387,6 +408,7 @@ function summary(input: ShapeInput, built: Built, links: Array<string | undefine
   // Minor issues by file, so a maintainer reads each file's together.
   const minor = own.filter((issue) => issue.severity === "minor").sort((a, b) => (repositoryPlaces(a)[0]?.file ?? "").localeCompare(repositoryPlaces(b)[0]?.file ?? ""));
   if (minor.length) sections.push(`#### ${HEADING.minor} (${minor.length})\n\n<details>\n<summary>${count(minor.length, "minor issue")}, by file</summary>\n\n${list(minor, "minor")}\n\n</details>`);
+  if (named.length) sections.push(`#### Named in this pull request (${named.length})\n\n<details>\n<summary>${count(named.length, "issue")} the description or commit messages name, with a reason for leaving ${named.length === 1 ? "it" : "them"} that holds by reading, which ${named.length === 1 ? "doesn't" : "don't"} weigh in the recommendation</summary>\n\n${list(named, "named")}\n\n</details>`);
   const base = review.issues.filter((issue) => issue.origin === "base");
   if (base.length) sections.push(`#### In existing code (${base.length})\n\n<details>\n<summary>${count(base.length, "issue")} in code that was there before this change, which ${base.length === 1 ? "doesn't" : "don't"} weigh in the recommendation</summary>\n\n${list(base, "base")}\n\n</details>`);
   return sections.join("\n\n");
@@ -407,10 +429,10 @@ export function buildShapeReview(given: ShapeInput, links: Array<string | undefi
   const built = chooseComments(input);
   const total = Math.max(input.review.issues.length, input.review.unreadChanges.files.length, 1);
   const limit = BODY_LIMIT - tail(input.review).length;
-  const all = new Set<Part>(["minor", "base", "should-fix", "blocker"]);
+  const all = new Set<Part>(["minor", "named", "base", "should-fix", "blocker"]);
   const tries: Array<{ compact: Set<Part>; keep: number }> = [
     { compact: new Set(), keep: total },
-    { compact: new Set(["minor", "base"]), keep: total },
+    { compact: new Set(["minor", "named", "base"]), keep: total },
     { compact: all, keep: total },
   ];
   for (const attempt of tries) {

@@ -11,7 +11,7 @@ import { changeTextTool, readTools, safeRelativePath, type ChangeTexts, type Rea
 import { entryHunks, entryOf, HAND_IN_TURNS, KINDS, SEVERITIES, type Finding, type Hunk, type Kind, type Place, type Severity } from "./types.ts";
 import type { Lens, Task } from "./plan.ts";
 
-export const FIND_SOURCE = { name: "workflow:review-find", blob: "20fdace4d5cb9f3f4f40584b1b65e0c7c8b810bf" };
+export const FIND_SOURCE = { name: "workflow:review-find", blob: "24eb3cee02d9af99745f8e3c898879417deae72a" };
 
 /** The change's own text, which a finding may cite as a place. Finders read both with read_change_text, and their brief gives each one's length. */
 export const TEXT_FILES = ["change-text.md", "commit-messages.txt"];
@@ -189,7 +189,7 @@ export function taskBrief(task: Task, change: ChangeBrief, lenses: Record<string
     const lensed = ids.length === 1 ? " Review them through this one lens, and report the defects it shows:" : through;
     // A ranged entry is sized by the hunks that reach its lines, so its brief points at them, as a files slice's does.
     const ranged = (slice.files ?? []).filter((file) => entryOf(file).range);
-    return `You are reviewing the tests of a code change against its code. ${reachOf(change).diff}; its tests are ${filesText(slice.files ?? [])}${ranged.length ? `, and ${ranged.map((file) => `for ${fileText(file)}, ${diffOf(change, file)}`).join("; ")}` : ""}.${purposeText(slice.purpose)}${ids.length ? `${lensed}\n\n${lensText(ids, lenses)}` : " Report the defects you find in them, and the requirements of the code no test pins."}`;
+    return `You are reviewing the tests of a code change against its code. ${reachOf(change).diff}; its tests are ${filesText(slice.files ?? [])}${ranged.length ? `, and ${ranged.map((file) => `for ${fileText(file)}, ${diffOf(change, file)}`).join("; ")}` : ""}.${purposeText(slice.purpose)}${ids.length ? `${lensed}\n\n${lensText(ids, lenses)}` : " Report the defects you find in them, and the requirements of the change no test pins."}`;
   }
   if (slice.kind === "state") {
     const reach = reachOf(change);

@@ -83,6 +83,8 @@ export interface PostedIssue {
   security: boolean;
   /** Where it is already named: "description", a thread item's or an open issue's URL, or "". */
   knownAt: string;
+  /** For one the change's own text names: whether it gives a reason for leaving it that holds, by the judge. */
+  reasonHolds: boolean;
   /** The judge's text of the issue, by reading. */
   text: string;
   /** The run that would confirm it, which the review shows for a blocker or should-fix; "" when the judge gave none. */
@@ -809,7 +811,7 @@ export function assembleReview(run: ShapeRun, head: string, base: string, models
           area: area.name, id, issue: issue.id, label: areaDir(run, plan, area), title: issue.title, severity: verdict.severity, kind: issue.kind, verdict: verdict.verdict,
           readers: [...new Set(issue.findings.map((member) => member.split(":")[0]!))].sort(),
           places, causes: issue.causes, consequences: issue.consequences, failingCase: members[0]?.failingCase ?? "", why: verdict.why,
-          origin: verdict.origin, security: verdict.security, knownAt: verdict.knownAt, text: verdict.text, confirm: verdict.confirm, repeats: [],
+          origin: verdict.origin, security: verdict.security, knownAt: verdict.knownAt, reasonHolds: verdict.reasonHolds, text: verdict.text, confirm: verdict.confirm, repeats: [],
         });
       }
     }
@@ -838,7 +840,10 @@ export function assembleReview(run: ShapeRun, head: string, base: string, models
     // A security issue any judge placed in the base's code is held: holding can be undone, and posting can't.
     kept.security = all.some((issue) => issue.security);
     kept.origin = kept.security && all.some((issue) => issue.origin === "base") ? "base" : all.some((issue) => issue.origin === "change") ? "change" : "base";
-    kept.knownAt = all.find((issue) => issue.knownAt)?.knownAt ?? "";
+    // Where it's named, and whether the reason given there holds, come from the same issue.
+    const named = all.find((issue) => issue.knownAt);
+    kept.knownAt = named?.knownAt ?? "";
+    kept.reasonHolds = named?.reasonHolds ?? false;
     kept.confirm = all.find((issue) => issue.confirm)?.confirm ?? "";
     kept.repeats = repeats.map((issue) => issue.id);
   }
