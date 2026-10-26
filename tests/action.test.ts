@@ -37,12 +37,12 @@ function stepBlock(name: string, source = ACTION): string {
   return lines.slice(start, end < 0 ? undefined : end).join("\n");
 }
 
-function runStep(name: string, env: Record<string, string>, setup?: (temp: string) => void, options: { source?: string; cwd?: string } = {}): { outputs: Record<string, string>; stdout: string; temp: string } {
+function runStep(name: string, env: Record<string, string>, setup?: (temp: string) => void, options: { source?: string; cwd?: string; errexit?: boolean } = {}): { outputs: Record<string, string>; stdout: string; temp: string } {
   const temp = mkdtempSync(join(tmpdir(), "action-step-"));
   const output = join(temp, "github-output");
   writeFileSync(output, "");
   setup?.(temp);
-  const stdout = execFileSync("bash", ["-c", stepScript(name, options.source)], {
+  const stdout = execFileSync("bash", [...(options.errexit ? ["-e"] : []), "-c", stepScript(name, options.source)], {
     env: { PATH: `${join(temp, "bin")}:${process.env.PATH}`, RUNNER_TEMP: temp, GITHUB_WORKSPACE: temp, GITHUB_OUTPUT: output, ...env },
     encoding: "utf8",
     ...(options.cwd ? { cwd: join(temp, options.cwd) } : {}),
@@ -448,6 +448,8 @@ test("each value a step reads is bound from the input or variable it stands for"
   bound("Check who asked", "OFF_LABEL: ${{ inputs.off-label }}");
   bound("Check who asked", "MODEL_API_KEY: ${{ inputs.model-api-key }}");
   bound("Check who asked", "COMMENT: ${{ github.event.comment.body }}", WORKFLOW);
+  bound("Check who asked", "NUMBER: ${{ github.event.issue.number }}", WORKFLOW);
+  bound("Check who asked", "RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", WORKFLOW);
   bound("Check who asked", "DEFAULT_PIPELINE: ${{ vars.REVIEW_PIPELINE }}", WORKFLOW);
   bound("Post the review", "DEEP_COMMAND: ${{ inputs.deep-command }}");
   bound("Post the review", "OFF_LABEL: ${{ inputs.off-label }}");
@@ -512,6 +514,30 @@ test("the shared workflow reviews a write-access /review deep comment with the s
   assert.deepEqual(ask("workflow_dispatch", ""), { pipeline: "reader", command: "/review", allowed: "true" }, "a manual run is the default's");
   assert.equal(ask("issue_comment", "/review deep", "", "read").allowed, undefined, "and asks write access, as /review does");
   assert.equal(ask("issue_comment", "/review deep", "", "triage").allowed, undefined);
+});
+
+test("a write-access /review deep comment is answered as the run starts, and no other request is", () => {
+  const ask = (event: string, comment: string, options: { permission?: string; answer?: number; defaultPipeline?: string } = {}) => {
+    const run = runStep("Check who asked", {
+      EVENT_NAME: event, COMMENT: comment, NUMBER: "7", RUN: "https://github.com/o/r/actions/runs/9", DEFAULT_PIPELINE: options.defaultPipeline ?? "", REVIEW_COMMAND: "/review", DEEP_COMMAND: "/review deep", REPO: "o/r", ACTOR: "someone", GH_TOKEN: "t",
+    }, (temp) => stub(temp, "gh", `if [ "$1 $2" = "pr comment" ]; then printf '%s\\0' "$@" > "$RUNNER_TEMP/answered"; exit ${options.answer ?? 0}; fi\necho ${options.permission ?? "write"}`), { source: WORKFLOW, errexit: true });
+    const file = join(run.temp, "answered");
+    return { outputs: run.outputs, stdout: run.stdout, answered: existsSync(file) ? readFileSync(file, "utf8").split("\0").slice(0, -1) : [] };
+  };
+  const deep = ask("issue_comment", "/review deep\r\nThe auth part, please.");
+  assert.deepEqual(deep.answered, [
+    "pr", "comment", "7", "--repo", "o/r", "--body",
+    "A deep review of this pull request has been requested. It usually takes less than 30 minutes, though it may first wait for an earlier review of this pull request to finish. When it finishes, the review is posted on this pull request.\n\nThe run: https://github.com/o/r/actions/runs/9\n\n<!-- rev-engine-prime -->",
+  ], "the answer carries the marker that tells the workflow's own posts from others' when a later review reads the thread");
+  assert.deepEqual(deep.outputs, { pipeline: "shape", command: "/review deep", allowed: "true" });
+  assert.deepEqual(ask("issue_comment", "/review").answered, [], "a plain /review");
+  assert.deepEqual(ask("issue_comment", "/review", { defaultPipeline: "shape" }).answered, [], "a plain /review where the shape is the default");
+  assert.deepEqual(ask("issue_comment", "/review deep", { permission: "read" }).answered, [], "a comment from someone without write access, which runs nothing");
+  assert.deepEqual(ask("pull_request_target", "").answered, []);
+  assert.deepEqual(ask("workflow_dispatch", "").answered, []);
+  const refused = ask("issue_comment", "/review deep", { answer: 1 });
+  assert.deepEqual(refused.outputs, { pipeline: "shape", command: "/review deep", allowed: "true" }, "an answer GitHub refuses doesn't stop the review");
+  assert.match(refused.stdout, /::warning::Could not answer the \/review deep comment; the review goes on/);
 });
 
 test("what follows the review's pipeline in the shared workflow reads the who job's choice, not the repository's default", () => {
