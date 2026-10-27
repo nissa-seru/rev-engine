@@ -1,6 +1,6 @@
 // The review shape end to end: the planner, both batteries over every area, the grouper, the judge and the severity
 // check, with each area's run directory written as it goes. Every answer is kept as it arrives, so a review stopped
-// partway for any reason but a refused call (Sol unavailable, the review's time limit, a stage that failed) is resumed
+// partway for any reason but a refused call (battery A's model unavailable, the review's time limit, a stage that failed) is resumed
 // from them, asking only the finder calls with no kept answer.
 import { execFile } from "node:child_process";
 import { createReadStream } from "node:fs";
@@ -24,17 +24,21 @@ import { clause, entryOf, SEVERITY_RANK, type Finding, type Hunk, type Issue, ty
 const execFileAsync = promisify(execFile);
 
 /** The models of each stage, through the configured endpoints. The planner, the judge and the large grouper share the first. */
-export const SHAPE_MODELS = { haiku: "claude-haiku-5-5", sol: "gpt-6.1-sol" };
-const EFFORT = { opus: "high", haiku: "max", sol: "xhigh" };
+export const SHAPE_MODELS = { haiku: "claude-haiku-5-5", sol: "gpt-6.1-sol", terra: "gpt-6.1-terra" };
+const BATTERY_A = {
+  terra: { model: SHAPE_MODELS.terra, name: "Terra" },
+  sol: { model: SHAPE_MODELS.sol, name: "Sol" },
+} as const;
+const EFFORT = { opus: "high", haiku: "max", batteryA: "xhigh" };
 /** The context, in tokens, at which a run is made to hand in what it has : where the ported workflow's workers would fold. */
-const BOUND = { haiku: 90_000, sol: 300_000 };
-/** Time kept back for a Sol finder's last turn, which can take minutes at xhigh, when the review nears its limit. */
-const SOL_WRAP_UP_MS = 15 * 60 * 1000;
+const BOUND = { haiku: 90_000, batteryA: 300_000 };
+/** Time kept back for a battery A finder's last turn, which can take minutes at xhigh, when the review nears its limit. */
+const BATTERY_A_WRAP_UP_MS = 15 * 60 * 1000;
 /** How near the review's limit a failure counts as the limit itself. */
 const LIMIT_MARGIN_MS = 2 * 60 * 1000;
 /**
  * The review's own time limit, set inside the job's: GitHub stops a job at 6 hours, so the review stops itself a little
- * before that with its answers kept, and is resumed like a Sol failure. Turns are capped only as a guard.
+ * before that with its answers kept, and is resumed like a call to an unavailable model. Turns are capped only as a guard.
  */
 const RUN_LIMIT_MS = 5.5 * 60 * 60 * 1000;
 const MAX_TURNS = 1_000;
@@ -48,7 +52,7 @@ export function leftToSource(path: string): boolean {
 }
 const MAX_INDEXED_FILES = 20_000;
 
-export type StopReason = "sol-unavailable" | "refused" | "time" | "failed";
+export type StopReason = "unavailable" | "refused" | "time" | "failed";
 
 export interface ShapeStop {
   reason: StopReason;
@@ -159,19 +163,19 @@ export interface ShapeRun {
  * Why a failure stops the review. A refusal keeps its category alone, and a request the API rejected (a 4xx other
  * than 408 or 429) fails whenever it happened, since sending it again gets the same. Any other failure within `margin`
  * of the review's limit, when it happened, is the limit, since a call cut off there looks like one that couldn't be
- * reached. A Sol finder's margin covers the time its last turn is given (SOL_WRAP_UP_MS), since its ordinary turns are
+ * reached. A battery A finder's margin covers the time its last turn is given (BATTERY_A_WRAP_UP_MS), since its ordinary turns are
  * cut off there.
  */
 export function stopReasonOf(error: unknown, deadline: number, at = Date.now(), margin = LIMIT_MARGIN_MS): { reason: StopReason; category?: string } {
   if (error instanceof ModelRefused) return { reason: "refused", category: error.category };
   if (error instanceof ModelError && !(error instanceof ModelUnavailable) && error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429) return { reason: "failed" };
   if (at >= deadline - margin || /ran out of time before submitting/.test(told(error))) return { reason: "time" };
-  if (error instanceof ModelUnavailable) return { reason: "sol-unavailable" };
+  if (error instanceof ModelUnavailable) return { reason: "unavailable" };
   return { reason: "failed" };
 }
 
 /** Which of several failures decides the stop: a refusal, then one a later run can get past, then any other. */
-const STOP_ORDER: Record<StopReason, number> = { refused: 0, "sol-unavailable": 1, time: 1, failed: 2 };
+const STOP_ORDER: Record<StopReason, number> = { refused: 0, unavailable: 1, time: 1, failed: 2 };
 
 /** The failure that decides the stop, by STOP_ORDER; the first of equals. */
 export function decidingFailure<T extends { why: { reason: StopReason } }>(failures: T[]): T | undefined {
@@ -338,12 +342,13 @@ export async function surroundings(repoDir: string): Promise<{ text: string; ins
   return { text: lines.join("\n"), installed, javascript, fromRanges };
 }
 
-/** A kept plan, when it is this review's (label, base, head, and the base its rules were read from) and has an area to
+/** A kept plan, when it is this review's (label, base, head, the base its rules were read from, and battery A's model) and has an area to
  * read: a plan with none would review nothing and read as a clean review. */
-export function keptPlanOf<T extends { label: string; base: string; head: string; rulesBase: string; plan: Plan; problems: string[] }>(
-  kept: T | null, identity: { label: string; base: string; head: string; rulesBase: string },
+export function keptPlanOf<T extends { label: string; base: string; head: string; rulesBase: string; batteryA?: string; plan: Plan; problems: string[] }>(
+  kept: T | null, identity: { label: string; base: string; head: string; rulesBase: string; batteryA: string },
 ): T | null {
   return kept && kept.label === identity.label && kept.base === identity.base && kept.head === identity.head && kept.rulesBase === identity.rulesBase
+    && kept.batteryA === identity.batteryA
     && Array.isArray(kept.plan?.areas) && kept.plan.areas.length > 0 ? kept : null;
 }
 
@@ -490,9 +495,9 @@ export async function keptAnswers(dir: string | null, log: (message: string) => 
 
 export interface ShapeOptions {
   config: Config;
-  /** Claude models through the Messages endpoint, and Sol through the Responses endpoint. */
+  /** Claude models through the Messages endpoint, and battery A's model through the Responses endpoint. */
   claude: Chat;
-  sol: Chat;
+  responses: Chat;
   run: ShapeRun;
   usageByCaller: Map<string, Usage>;
   usageByModel: Map<string, Usage>;
@@ -500,7 +505,7 @@ export interface ShapeOptions {
 }
 
 /**
- * The review shape on one pull request. A failure in any stage stops the review as a Sol call's does, with every answer
+ * The review shape on one pull request. A failure in any stage stops the review as a battery A call's does, with every answer
  * kept and the stop's reason recorded, rather than leaving the process with nothing said: a planner, grouper or judge
  * that can't be reached, or the review's own limit.
  */
@@ -520,8 +525,9 @@ export async function shapeReview(options: ShapeOptions): Promise<ShapeOutcome> 
 }
 
 async function reviewStages(options: ShapeOptions, started: number, deadline: number): Promise<ShapeOutcome> {
-  const { config, claude, sol, run, log } = options;
+  const { config, claude, responses, run, log } = options;
   const opus = config.models[0]!;
+  const batteryA = BATTERY_A[config.shape!.batteryA];
   // A finder's workspace serves the change's description and commit messages too, and the judge's the thread and open
   // issues; the planner's serves neither.
   const workspace = (texts: ChangeTexts | null = null, known: KnownTexts | null = null): Workspace => new Workspace(config.repoDir, config.diffPath, config.base, texts, known);
@@ -584,12 +590,12 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   await mkdir(run.outDir, { recursive: true });
 
   // 1. The plan, or the plan an earlier run of this review wrote, so a resumed review reads what it was asked. A kept
-  // plan of another review (another round, base or head), or one that can't be read, is set aside with its answers.
-  const identity = { label: run.label, base: config.base, head: config.head, rulesBase };
-  const keptState = run.keptDir ? await readJson<{ label: string; base: string; head: string; rulesBase: string; plan: Plan; problems: string[] }>(join(run.keptDir, "shape-plan.json")) : null;
+  // plan of another review (another round, base, head or battery A model), or one that can't be read, is set aside with its answers.
+  const identity = { label: run.label, base: config.base, head: config.head, rulesBase, batteryA: batteryA.model };
+  const keptState = run.keptDir ? await readJson<{ label: string; base: string; head: string; rulesBase: string; batteryA?: string; plan: Plan; problems: string[] }>(join(run.keptDir, "shape-plan.json")) : null;
   const keptPlan = keptPlanOf(keptState, identity);
   if (run.keptDir && !keptPlan) {
-    log(`not resuming: the kept state at ${run.keptDir} holds no readable plan of this review (${identity.label} at ${identity.head.slice(0, 12)} from ${identity.base.slice(0, 12)})`);
+    log(`not resuming: the kept state at ${run.keptDir} holds no readable plan of this review (${identity.label} at ${identity.head.slice(0, 12)} from ${identity.base.slice(0, 12)}, battery A on ${identity.batteryA})`);
     // So the run's record doesn't call it resumed.
     run.keptDir = null;
   }
@@ -618,10 +624,10 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   log(`plan: ${plan.areas.length} area(s), ${plan.areas.reduce((sum, area) => sum + area.tasks.length + area.questions.length, 0)} task(s) and question(s), ${plan.facts.length} fact(s)`);
 
   const batteries: Battery[] = [
-    { letter: "A", model: SHAPE_MODELS.sol, effort: EFFORT.sol, perCall: 2, contextTokens: BOUND.sol, countdown: false, wrapUpMs: SOL_WRAP_UP_MS },
+    { letter: "A", model: batteryA.model, effort: EFFORT.batteryA, perCall: 2, contextTokens: BOUND.batteryA, countdown: false, wrapUpMs: BATTERY_A_WRAP_UP_MS },
     { letter: "B", model: SHAPE_MODELS.haiku, effort: EFFORT.haiku, perCall: 1, contextTokens: BOUND.haiku, countdown: true },
   ];
-  const chatOf = (letter: string): Chat => (letter === "A" ? sol : claude);
+  const chatOf = (letter: string): Chat => (letter === "A" ? responses : claude);
   const roundNote = run.roundOf ? `The base of this review is the head an earlier review of this pull request read, so it shows only what changed since; read_base_file reads that head.` : "";
 
   const around = await surroundings(config.repoDir);
@@ -653,17 +659,17 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
     return { area, dir, answers: outcomes.flatMap((outcome) => outcome.answers), failed: outcomes.flatMap((outcome) => outcome.failed) };
   }));
 
-  // A Sol call that gave no answer stops the review once every call of every area has finished, with every answer
+  // A battery A call that gave no answer stops the review once every call of every area has finished, with every answer
   // kept (but a refusal's); haiku never reads in its place. A failed call doesn't stop its siblings, which were all
-  // sent at the start. Each failure is judged as of when it happened. A refusal (only Sol's calls are refused) decides
+  // sent at the start. Each failure is judged as of when it happened. A refusal (only battery A's calls are refused) decides
   // the stop, since a review stopped for another reason is resumed and a refused call isn't; then one a later run can
   // get past.
-  const solFailures = found.flatMap((entry) => entry.failed.filter((failure) => failure.battery === "A").map((failure) => ({
-    ...failure, area: entry.area.name, why: stopReasonOf(failure.error, deadline, failure.at, SOL_WRAP_UP_MS + LIMIT_MARGIN_MS),
+  const batteryAFailures = found.flatMap((entry) => entry.failed.filter((failure) => failure.battery === "A").map((failure) => ({
+    ...failure, area: entry.area.name, why: stopReasonOf(failure.error, deadline, failure.at, BATTERY_A_WRAP_UP_MS + LIMIT_MARGIN_MS),
   })));
-  const solFailure = decidingFailure(solFailures);
-  if (solFailure) {
-    const stop = stopFor(solFailure.error, deadline, `a Sol call (${solFailure.area} A:${solFailure.call})`, solFailure.at, SOL_WRAP_UP_MS + LIMIT_MARGIN_MS);
+  const batteryAFailure = decidingFailure(batteryAFailures);
+  if (batteryAFailure) {
+    const stop = stopFor(batteryAFailure.error, deadline, `a ${batteryA.name} call (${batteryAFailure.area} A:${batteryAFailure.call})`, batteryAFailure.at, BATTERY_A_WRAP_UP_MS + LIMIT_MARGIN_MS);
     // A record that can't be written mustn't turn this stop (a refusal, say) into a failure of the stage.
     await writeJson(join(run.outDir, "run.json"), runRecord(run, config, stop, started, options))
       .catch((error: unknown) => log(`the stop couldn't be recorded in run.json: ${told(error)}`));
@@ -746,7 +752,7 @@ async function reviewStages(options: ShapeOptions, started: number, deadline: nu
   for (const { area, judging } of judged) {
     if (judging.unjudged.length && judging.errors.length) problems.push(`The judge${plan.areas.length > 1 ? ` (area ${area.name})` : ""} gave no verdict on ${judging.unjudged.length} issue(s); its calls that failed along the way failed with ${judging.errors.join("; ")}.`);
   }
-  const review = assembleReview(run, config.head, config.base, { planner: opus, batteryA: SHAPE_MODELS.sol, batteryB: SHAPE_MODELS.haiku, judge: opus }, judged, plan, problems, changedFiles, key, diff, settled.sameAs, config.nwo);
+  const review = assembleReview(run, config.head, config.base, { planner: opus, batteryA: batteryA.model, batteryB: SHAPE_MODELS.haiku, judge: opus }, judged, plan, problems, changedFiles, key, diff, settled.sameAs, config.nwo);
   // The maintainers' decisions this review collected go to its first area's run directory, which the store keys them by.
   const decided = await readFile(join(dirname(config.priorJsonPath), "decisions.jsonl"), "utf8").catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "ENOENT") log(`the maintainers' decisions couldn't be read, so the run directory goes without them: ${told(error)}`);
@@ -893,6 +899,7 @@ function runRecord(run: ShapeRun, config: Config, stop: ShapeStop | null, starte
   return {
     label: run.label, round: run.round, ...(run.roundOf ? { roundOf: run.roundOf } : {}), base: config.base, head: config.head,
     outcome: stop ? `stopped: ${stop.reason}` : "done", ...(stop ? { stop } : {}),
+    batteryA: BATTERY_A[config.shape!.batteryA].model,
     workflowRun: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
     resumedFrom: run.resumed ? process.env.RB_SHAPE_RESUMED_FROM ?? "an earlier run" : null,
     seconds: Math.round((Date.now() - started) / 1000),

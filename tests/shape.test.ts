@@ -374,6 +374,17 @@ function shapeReview(issues: PostedIssue[], extra: Partial<ShapeReview> = {}): S
   };
 }
 
+test("a summary given the deep command ends by naming it, before the markers a later round reads, whatever it cut", () => {
+  const onSol = "For a review with Sol in place of Terra as one of its two readers, a maintainer can comment `/review deep`.";
+  const lines = (body: string) => body.split("\n").filter(Boolean);
+  const given = buildShapeReview({ review: shapeReview([posted("I1", "blocker")]), hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 10, deepCommand: "/review deep" }).body;
+  assert.equal(lines(given).at(-3), onSol);
+  assert.match(lines(given).at(-2)!, /^<!-- rev-engine-shape-review re-o\.n-1-1 abcdef0123456789 -->$/, "the review's own marker stays the last line but one");
+  const cut = buildShapeReview({ review: shapeReview(Array.from({ length: 2_000 }, (_, index) => ({ ...posted(`I${index + 1}`, "minor"), title: `Issue ${index + 1} ${"t".repeat(200)}` }))), hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 10, deepCommand: "/review deep" }).body;
+  assert.equal(lines(cut).at(-3), onSol, "and survives the summary's cut");
+  assert.doesNotMatch(buildShapeReview({ review: shapeReview([posted("I1", "blocker")]), hunks: parseHunks(DIFF), existing: [], minSeverity: "medium", maxComments: 10 }).body, /in place of Terra/, "without the command, nothing is named");
+});
+
 test("the review comments on blockers and should-fix issues a hunk shows, and lists every issue by severity", () => {
   const review = shapeReview([posted("I1", "blocker"), posted("I2", "should-fix", 12, ["B"]), posted("I3", "should-fix", 40), posted("I4", "minor")], {
     shortfall: ["B:t2"], notReal: [{ area: "all", id: "I5", title: "Not it", notRealKind: "cannot happen", why: "guarded", places: [{ file: "src/a.ts", line: 1 }] }],
@@ -508,12 +519,12 @@ test("the findings file gives each issue at its first place in a repository file
 test("a failure stops the review for its reason, a refusal by its category alone, and at the limit as the limit", () => {
   const later = Date.now() + 3_600_000;
   assert.deepEqual(stopReasonOf(new ModelRefused(500, "cyber_policy"), later), { reason: "refused", category: "cyber_policy" });
-  assert.deepEqual(stopReasonOf(new ModelUnavailable(502, "no usable credential"), later), { reason: "sol-unavailable" });
+  assert.deepEqual(stopReasonOf(new ModelUnavailable(502, "no usable credential"), later), { reason: "unavailable" });
   assert.deepEqual(stopReasonOf(new Error("gpt-6.1-sol ran out of time before submitting"), later), { reason: "time" });
   assert.deepEqual(stopReasonOf(new ModelError(400, "bad request"), later), { reason: "failed" });
   // A provider's body that quotes the phrase decides nothing: the stop reads what told() says.
   assert.deepEqual(stopReasonOf(new ModelError(500, "model API returned 500: gpt-6.1-sol ran out of time before submitting"), later), { reason: "failed" });
-  assert.deepEqual(stopReasonOf(new ModelUnavailable(503, "model API returned 503: ran out of time before submitting"), later), { reason: "sol-unavailable" });
+  assert.deepEqual(stopReasonOf(new ModelUnavailable(503, "model API returned 503: ran out of time before submitting"), later), { reason: "unavailable" });
   // A call cut off at the review's limit looks unreachable, and is the limit; a refusal there is still a refusal.
   assert.deepEqual(stopReasonOf(new ModelUnavailable(502, "aborted"), Date.now() + 30_000), { reason: "time" });
   assert.deepEqual(stopReasonOf(new ModelRefused(500, "bio_policy"), Date.now()), { reason: "refused", category: "bio_policy" });
@@ -788,11 +799,11 @@ test("the large grouper's empty grouping leaves every finding its own issue, and
   assert.equal(issues.find((issue) => issue.findings[0] === "B:t[0]")!.title, "claim B:t[0]", "the claim of the finding it keeps, not of one it lost");
 });
 
-test("a Sol failure is judged as of when it happened, its last turn's reserve counted as the limit", () => {
+test("a battery A failure is judged as of when it happened, its last turn's reserve counted as the limit", () => {
   // Looked at inside the limit's margin, as the review looks at its failures once every call has finished.
   const deadline = Date.now() + 60_000;
   const early = deadline - 30 * 60_000;
-  assert.deepEqual(stopReasonOf(new ModelUnavailable(502, "no seat"), deadline, early), { reason: "sol-unavailable" }, "an early failure isn't the limit, however late it's looked at");
+  assert.deepEqual(stopReasonOf(new ModelUnavailable(502, "no seat"), deadline, early), { reason: "unavailable" }, "an early failure isn't the limit, however late it's looked at");
   assert.deepEqual(stopReasonOf(new ModelUnavailable(502, "aborted"), deadline, deadline - 10 * 60_000, 17 * 60_000), { reason: "time" });
   assert.deepEqual(stopReasonOf(new ModelError(400, "bad"), deadline, deadline - 60_000), { reason: "failed" }, "a request the API rejected fails, however near the limit");
   assert.deepEqual(stopReasonOf(new ModelError(408, "request timeout"), deadline, deadline - 60_000), { reason: "time" }, "a request timeout near the limit is the limit");
@@ -801,8 +812,8 @@ test("a Sol failure is judged as of when it happened, its last turn's reserve co
 
 test("a refusal decides the stop over a failure a later run can get past, and that over any other", () => {
   const of = (reason: StopReason, call: string) => ({ call, why: { reason } });
-  assert.equal(decidingFailure([of("failed", "a"), of("sol-unavailable", "b"), of("refused", "c"), of("time", "d")])!.call, "c");
-  assert.equal(decidingFailure([of("failed", "a"), of("time", "b"), of("sol-unavailable", "c")])!.call, "b");
+  assert.equal(decidingFailure([of("failed", "a"), of("unavailable", "b"), of("refused", "c"), of("time", "d")])!.call, "c");
+  assert.equal(decidingFailure([of("failed", "a"), of("time", "b"), of("unavailable", "c")])!.call, "b");
   assert.equal(decidingFailure([of("failed", "a")])!.call, "a");
   assert.equal(decidingFailure([]), undefined);
 });
@@ -824,12 +835,13 @@ test("a several-area plan whose areas all drop, with every changed file left to 
 });
 
 test("a kept plan is taken only when it is this review's and has an area to read", () => {
-  const identity = { label: "re-o.r-1-1", base: "b", head: "h", rulesBase: "b" };
+  const identity = { label: "re-o.r-1-1", base: "b", head: "h", rulesBase: "b", batteryA: "gpt-6.1-terra" };
   const plan: Plan = { facts: [], note: "", areas: [{ name: "all", files: [], questions: [], tasks: [{ id: "t", slice: { kind: "whole" }, lenses: [] }] }] };
   const kept = { ...identity, plan, problems: [] };
   assert.equal(keptPlanOf(kept, identity), kept);
   assert.equal(keptPlanOf({ ...kept, plan: { ...plan, areas: [] } }, identity), null, "a plan with no area would review nothing");
-  for (const field of ["label", "base", "head", "rulesBase"] as const) assert.equal(keptPlanOf({ ...kept, [field]: "other" }, identity), null, `another ${field}`);
+  for (const field of ["label", "base", "head", "rulesBase", "batteryA"] as const) assert.equal(keptPlanOf({ ...kept, [field]: "other" }, identity), null, `another ${field}`);
+  assert.equal(keptPlanOf({ ...kept, batteryA: undefined }, identity), null, "a plan kept before battery A's model was named");
   assert.equal(keptPlanOf({ ...kept, plan: { ...plan, areas: { length: 1 } as unknown as Plan["areas"] } }, identity), null, "areas that aren't a list");
   assert.equal(keptPlanOf(null, identity), null);
 });

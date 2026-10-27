@@ -120,10 +120,10 @@ try {
     }
     : send;
   if (config.shape) {
-    // The review shape asks Sol through Responses, with the same key and gateway headers as the Claude endpoint.
-    const sol = createChat({ apiKey: config.apiKey, baseUrl: config.shape.solBaseUrl, api: "responses", headers: config.headers, effort: null, usage, usageByCaller, usageByModel });
+    // The review shape asks battery A's model through Responses, with the same key and gateway headers as the Claude endpoint.
+    const responses = createChat({ apiKey: config.apiKey, baseUrl: config.shape.responsesBaseUrl, api: "responses", headers: config.headers, effort: null, usage, usageByCaller, usageByModel });
     const outcome = await shapeReview({
-      config, claude: chat, sol, usageByCaller, usageByModel, log,
+      config, claude: chat, responses, usageByCaller, usageByModel, log,
       run: { outDir: config.shape.outDir, keptDir: config.shape.keptDir, label: config.shape.label, round: config.shape.round, roundOf: config.shape.roundOf },
     });
     logUsageByCaller();

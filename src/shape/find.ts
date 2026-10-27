@@ -1,9 +1,9 @@
 // Stage 2 of the review shape: the two batteries. Every task of the plan, and each of its questions as a task of its
-// own, is read once by each battery: battery A on Sol, two consecutive tasks to a call, and battery B on haiku, one
+// own, is read once by each battery: battery A on terra or Sol, two consecutive tasks to a call, and battery B on haiku, one
 // task to a call, every call at once. Ported from the review workflow's find stage (FIND_SOURCE): its brief for each
 // slice kind, its two-part calls, its lenses' "Look for" lists and its answer, with RevEngine's read tools in place
-// of a shell in a scratch copy. A Sol call that doesn't answer stops the review, with every answer kept, and haiku
-// never reads in Sol's place.
+// of a shell in a scratch copy. A battery A call that doesn't answer stops the review, with every answer kept, and
+// haiku never reads in its place.
 import { runAgent } from "../agent.ts";
 import { told, type Chat } from "../llm.ts";
 import { UNTRUSTED } from "../prompts.ts";
@@ -34,11 +34,11 @@ export function numberedLines(text: string): number {
 }
 
 export interface Battery {
-  /** A capital letter: A for Sol, B for haiku. */
+  /** A capital letter: A for terra or Sol, B for haiku. */
   letter: string;
   model: string;
   effort: string | null;
-  /** Tasks per call: 2 for Sol, 1 for haiku. */
+  /** Tasks per call: 2 for battery A, 1 for haiku. */
   perCall: number;
   /** The context size, in tokens, at which a finder is made to hand in what it has. */
   contextTokens: number;

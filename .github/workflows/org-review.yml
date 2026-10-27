@@ -1,9 +1,10 @@
 # One review workflow for many repositories, each of which calls it from a short workflow of its
 # own, such as this repository's review.yml. It reviews every pull request when it's opened,
-# reopened or marked ready, whoever its author, unless the caller turns at-open off, and again
-# whenever a person with write access comments /review. Such a person's comment of /review deep
-# reviews it with the review shape instead, whatever the repository's default, and is answered as
-# the run starts, since that review takes a while.
+# reopened or marked ready, unless the caller turns at-open off or its author is one the caller
+# names in REVIEW_SKIP_AUTHORS, and again whenever a person with write access comments /review.
+# Such a person's comment of /review deep reviews it with the review shape on Sol instead, whatever
+# the repository's default, and is answered as the run starts, since that review takes a while; a
+# /review that runs the shape is answered the same way.
 #
 # The runner joins a private tailnet for the length of the job, as an ephemeral device tagged
 # tag:ci, through Tailscale's workload identity federation, and reviews through a model
@@ -19,13 +20,15 @@
 #
 # The caller's repository or organization provides variables TS_CLIENT_ID and TS_AUDIENCE
 # (the federated identity), MODEL_HOST (the endpoint's tailnet address, which the join waits
-# to reach), MODEL_BASE_URL (the endpoint's base URL for Anthropic Messages) and SOL_BASE_URL
-# (its base URL for OpenAI Responses, which the shape needs, so any /review deep), and the
+# to reach), MODEL_BASE_URL (the endpoint's base URL for Anthropic Messages) and RESPONSES_BASE_URL
+# (its base URL for OpenAI Responses, where every review shape asks battery A), and the
 # secret MODEL_API_KEY, whose grant must reach both.
 #
-# With the variable REVIEW_PIPELINE set to "shape", every review is the review shape (src/shape);
-# without it, only a /review deep comment's is, and every other review is RevEngine's own
-# reviewer. The shape seals the run it saves with MODEL_API_KEY (since anyone signed in to GitHub
+# With the variable REVIEW_PIPELINE set to "shape", every review is the review shape (src/shape),
+# its battery A on terra but for a /review deep comment's, on Sol; without it, only a /review deep
+# comment's is, and every other review is RevEngine's own reviewer. REVIEW_SKIP_AUTHORS optionally
+# names accounts, separated by spaces or line breaks and in any case, whose pull requests aren't reviewed when they're opened,
+# reopened or marked ready; a /review comment still reviews them. The shape seals the run it saves with MODEL_API_KEY (since anyone signed in to GitHub
 # can download a public repository's artifacts, and the run holds what the review doesn't post),
 # reads the repository's open issues when the caller's permissions grant issues: read, may take up
 # to the job's six hours, and reads the head's dependencies, installed by a job of their own.
@@ -66,11 +69,12 @@ jobs:
       allowed: ${{ steps.who.outputs.allowed }}
       pipeline: ${{ steps.who.outputs.pipeline }}
       command: ${{ steps.who.outputs.command }}
+      battery-a: ${{ steps.who.outputs.battery-a }}
       head: ${{ steps.head.outputs.head }}
     steps:
       # A comment or a manual run asks as a person, who needs write access; the action checks this
       # too, but only after the join, so it's checked here first. A pull request event asks as
-      # this workflow, whose at-open input decides.
+      # this workflow, whose at-open input decides, unless REVIEW_SKIP_AUTHORS names its author.
       - name: Check who asked
         id: who
         env:
@@ -82,27 +86,40 @@ jobs:
           NUMBER: ${{ github.event.issue.number }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           DEFAULT_PIPELINE: ${{ vars.REVIEW_PIPELINE }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          SKIP_AUTHORS: ${{ vars.REVIEW_SKIP_AUTHORS }}
         run: |
           [ -n "$REVIEW_COMMAND" ] && [ -n "$DEEP_COMMAND" ] || { echo "::error::The workflow's REVIEW_COMMAND or DEEP_COMMAND is empty"; exit 1; }
-          pipeline=${DEFAULT_PIPELINE:-reader}; command=$REVIEW_COMMAND
+          pipeline=${DEFAULT_PIPELINE:-reader}; command=$REVIEW_COMMAND; battery=terra
           if [ "$EVENT_NAME" = issue_comment ]; then
             case "$COMMENT" in
-              "$DEEP_COMMAND"|"$DEEP_COMMAND"[[:space:]]*) pipeline=shape; command=$DEEP_COMMAND ;;
+              "$DEEP_COMMAND"|"$DEEP_COMMAND"[[:space:]]*) pipeline=shape; command=$DEEP_COMMAND; battery=sol ;;
               "$REVIEW_COMMAND"|"$REVIEW_COMMAND"[[:space:]]*) ;;
               *) echo "::notice::No review: the comment is not $REVIEW_COMMAND"; exit 0 ;;
             esac
           fi
-          { echo "pipeline=$pipeline"; echo "command=$command"; } >> "$GITHUB_OUTPUT"
-          if [ "$EVENT_NAME" = pull_request_target ]; then echo "allowed=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          { echo "pipeline=$pipeline"; echo "command=$command"; echo "battery-a=$battery"; } >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = pull_request_target ]; then
+            read -ra skipped <<<"${SKIP_AUTHORS//[$'\r\n']/ }"
+            for login in "${skipped[@]}"; do
+              if [ "${login,,}" = "${AUTHOR,,}" ]; then echo "::notice::No review: pull requests $AUTHOR opens aren't reviewed when opened, reopened or marked ready (REVIEW_SKIP_AUTHORS); a $REVIEW_COMMAND comment reviews one"; exit 0; fi
+            done
+            echo "allowed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           # A failed lookup fails the run, rather than passing for "no write access".
           permission=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission)
           case "$permission" in
             admin|write)
               echo "allowed=true" >> "$GITHUB_OUTPUT"
+              body=""
               if [ "$command" = "$DEEP_COMMAND" ]; then
                 body="A deep review of this pull request has been requested. It usually takes less than 30 minutes, though it may first wait for an earlier review of this pull request to finish. When it finishes, the review is posted on this pull request."
+              elif [ "$EVENT_NAME" = issue_comment ] && [ "$pipeline" = shape ]; then
+                body="A review of this pull request has been requested. It may first wait for an earlier review of this pull request to finish. When the requested review finishes, it's posted on this pull request."
+              fi
+              if [ -n "$body" ]; then
                 gh pr comment "$NUMBER" --repo "$REPO" --body "$body"$'\n\n'"The run: $RUN"$'\n\n<!-- rev-engine-prime -->' ||
-                  echo "::warning::Could not answer the $DEEP_COMMAND comment; the review goes on"
+                  echo "::warning::Could not answer the $command comment; the review goes on"
               fi ;;
             *) echo "::notice::No review: $ACTOR does not have write access to $REPO" ;;
           esac
@@ -229,7 +246,8 @@ jobs:
           pipeline: ${{ needs.who.outputs.pipeline }}
           command: ${{ needs.who.outputs.command }}
           deep-command: ${{ env.DEEP_COMMAND }}
-          sol-base-url: ${{ vars.SOL_BASE_URL }}
+          responses-base-url: ${{ vars.RESPONSES_BASE_URL }}
+          battery-a: ${{ needs.who.outputs.battery-a }}
           # Named when the dependencies job passed them on; when it installed nothing or failed, the review reads
           # without them.
           dependencies: ${{ needs.dependencies.outputs.passed == 'true' && 'rev-engine-dependencies' || '' }}

@@ -133,10 +133,17 @@ test("reads the endpoint from the environment where it is set and not empty, and
 });
 
 test("the review shape reads project rules from the pull request's base, which a later round must name", () => {
-  const shape = { ...BASE, RB_MODEL_API: "anthropic", RB_MODEL_BASE_URL: "http://127.0.0.1:9/anthropic", RB_CONFIG_SHAPE: "on", RB_SOL_BASE_URL: "http://127.0.0.1:6175/openai/" };
+  const shape = { ...BASE, RB_MODEL_API: "anthropic", RB_MODEL_BASE_URL: "http://127.0.0.1:9/anthropic", RB_CONFIG_SHAPE: "on", RB_RESPONSES_BASE_URL: "http://127.0.0.1:6175/openai/" };
   const first = loadConfig(shape).shape!;
   assert.equal(first.rulesBase, BASE.RB_BASE, "a first round reads them from its own base");
-  assert.equal(first.solBaseUrl, "http://127.0.0.1:6175/openai");
+  assert.equal(first.responsesBaseUrl, "http://127.0.0.1:6175/openai");
+  assert.equal(first.batteryA, "terra", "battery A reads on terra unless told otherwise");
+  assert.equal(loadConfig({ ...shape, RB_SHAPE_BATTERY_A: "" }).shape!.batteryA, "terra", "and an empty setting, as the Action passes an input it wasn't given");
+  assert.equal(loadConfig({ ...shape, RB_SHAPE_BATTERY_A: "sol" }).shape!.batteryA, "sol");
+  assert.throws(() => loadConfig({ ...shape, RB_SHAPE_BATTERY_A: "gpt-6.1-sol" }), /RB_SHAPE_BATTERY_A must be terra or sol/);
+  assert.throws(() => loadConfig({ ...shape, RB_SHAPE_BATTERY_A: " sol " }), /RB_SHAPE_BATTERY_A must be terra or sol/, "a padded value too, which the Action's other steps read as given");
+  assert.throws(() => loadConfig({ ...shape, RB_RESPONSES_BASE_URL: "" }), /RB_RESPONSES_BASE_URL/);
+  assert.match(describeSettings(loadConfig({ ...shape, RB_SHAPE_BATTERY_A: "sol" })), / battery_a=sol /);
   assert.equal(loadConfig({ ...shape, RB_SHAPE_RULES_BASE: "c".repeat(40) }).shape!.rulesBase, "c".repeat(40));
   assert.throws(() => loadConfig({ ...shape, RB_SHAPE_ROUND: "2", RB_SHAPE_ROUND_OF: "re-owner.repo-1938-1" }), /RB_SHAPE_RULES_BASE/, "a later round's base is an earlier head of the pull request");
 });

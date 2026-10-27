@@ -88,6 +88,8 @@ export interface ShapeInput {
   maxComments: number;
   /** The GitHub the review runs on, which its permalinks point into: GITHUB_SERVER_URL, https://github.com by default. */
   server?: string;
+  /** A comment that starts a deeper review, named at the summary's end. */
+  deepCommand?: string;
 }
 
 /**
@@ -417,9 +419,10 @@ function summary(input: ShapeInput, built: Built, links: Array<string | undefine
   return sections.join("\n\n");
 }
 
-/** What ends every summary: the marker a later round reads its base from, and the action's own. */
-function tail(review: ShapeReview): string {
-  return `\n\n${reviewMarker(review)}\n${MARKER}`;
+/** What ends every summary: the Sol review's command, if any, then the marker a later round reads its base from, and the action's own. */
+function tail(input: ShapeInput): string {
+  const onSol = input.deepCommand ? `\n\nFor a review with Sol in place of Terra as one of its two readers, a maintainer can comment \`${input.deepCommand}\`.` : "";
+  return `${onSol}\n\n${reviewMarker(input.review)}\n${MARKER}`;
 }
 
 /**
@@ -431,7 +434,7 @@ export function buildShapeReview(given: ShapeInput, links: Array<string | undefi
   const input = { ...given, review: inertReview(given.review) };
   const built = chooseComments(input);
   const total = Math.max(input.review.issues.length, input.review.unreadChanges.files.length, 1);
-  const limit = BODY_LIMIT - tail(input.review).length;
+  const limit = BODY_LIMIT - tail(input).length;
   const all = new Set<Part>(["minor", "named", "base", "should-fix", "blocker"]);
   const tries: Array<{ compact: Set<Part>; keep: number }> = [
     { compact: new Set(), keep: total },
@@ -440,17 +443,17 @@ export function buildShapeReview(given: ShapeInput, links: Array<string | undefi
   ];
   for (const attempt of tries) {
     const body = summary(input, built, links, attempt.compact, attempt.keep);
-    if (body.length <= limit) return { body: body + tail(input.review), comments: built.comments };
+    if (body.length <= limit) return { body: body + tail(input), comments: built.comments };
   }
   // Still too long: halve each list until it fits. The markers go after any cut, so a later round and the decisions
   // still find the review.
   let keep = Math.max(1, Math.floor(total / 2));
   for (;;) {
     const body = summary(input, built, links, all, keep);
-    if (body.length <= limit) return { body: body + tail(input.review), comments: built.comments };
+    if (body.length <= limit) return { body: body + tail(input), comments: built.comments };
     if (keep === 1) {
       const note = `\n\n_The rest of this summary is cut to fit GitHub's size limit; ${KEPT_WHOLE}._`;
-      return { body: cut(body, limit - note.length) + note + tail(input.review), comments: built.comments };
+      return { body: cut(body, limit - note.length) + note + tail(input), comments: built.comments };
     }
     keep = Math.max(1, Math.floor(keep / 2));
   }

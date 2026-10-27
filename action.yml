@@ -12,7 +12,7 @@ inputs:
     description: The API the endpoint at model-base-url speaks, chat or anthropic, as RB_MODEL_API in docs/SETTINGS.md.
     default: ""
   model-api-key:
-    description: The key for the endpoint at model-base-url, which gets no other key. Pass it from a repository secret. The shape doesn't start without it, on OpenRouter too, since it also reaches Sol at sol-base-url, and seals the run the shape saves and what a stopped review keeps in GitHub's cache.
+    description: The key for the endpoint at model-base-url, which gets no other key. Pass it from a repository secret. The shape doesn't start without it, on OpenRouter too, since it also reaches battery A's model at responses-base-url, and seals the run the shape saves and what a stopped review keeps in GitHub's cache.
     default: ""
   github-token:
     description: Token used to read the pull request and post the review.
@@ -24,7 +24,7 @@ inputs:
     description: A comment starts a review only when it is this text, or this text followed by a space or a line break.
     default: /review
   deep-command:
-    description: A comment that the calling workflow reviews with the review shape, as the shared workflow does with /review deep. The reader's review then ends by saying a maintainer can comment it. Empty, as by default, for none.
+    description: A comment that the calling workflow reviews with the review shape, as the shared workflow does with /review deep. The reader's review, and the shape's with battery A on terra, then end by saying a maintainer can comment it. Empty, as by default, for none.
     default: ""
   off-label:
     description: A pull request carrying this label isn't reviewed unless someone comments the command. Put on while a review runs, it keeps that review from posting, and a stopped one from saying so, unless a comment asked for it. Its results are still saved. Empty for none.
@@ -48,11 +48,14 @@ inputs:
     description: Set to "true" to review pull requests from forks. Their code is only read, never run.
     default: "false"
   pipeline:
-    description: Which review runs. "reader" is RevEngine's own reviewer. "shape" is the review shape in src/shape - a planner, a Sol battery and a haiku battery over every task of its plan, a grouper, a judge and a severity check - which takes as long as it needs, up to the job's limit, and needs sol-base-url.
+    description: Which review runs. "reader" is RevEngine's own reviewer. "shape" is the review shape in src/shape - a planner, a battery on battery-a's model and a haiku battery over every task of its plan, a grouper, a judge and a severity check - which takes as long as it needs, up to the job's limit, and needs responses-base-url.
     default: reader
-  sol-base-url:
-    description: For the shape, where Sol is asked, an OpenAI Responses endpoint, as RB_SOL_BASE_URL in docs/SETTINGS.md. It is reached with model-api-key.
+  responses-base-url:
+    description: For the shape, where battery A's model is asked, an OpenAI Responses endpoint, as RB_RESPONSES_BASE_URL in docs/SETTINGS.md. It is reached with model-api-key.
     default: ""
+  battery-a:
+    description: For the shape, battery A's model, as RB_SHAPE_BATTERY_A in docs/SETTINGS.md. "terra", as by default, or "sol". A stopped review's kept answers are kept apart by it, so a review on one never goes on from the other's.
+    default: terra
   dependencies:
     description: For the shape, the name of an artifact of this workflow run that holds the head's installed dependencies, the contents of a node_modules directory, placed in the checkout's node_modules for the readers to read. Empty for none.
     default: ""
@@ -174,8 +177,8 @@ runs:
         # Paths as themselves, so a name outside ASCII is the same in the diff as in the checkout.
         git -C "$repo" -c core.quotePath=false diff "$BASE...$HEAD" > "$RUNNER_TEMP/rev-engine-prime/pr/diff.patch"
 
-    # A later review by the shape reads from the head its last review read, when that head is an ancestor of this
-    # one, so it reads only what changed since; otherwise it reads the whole pull request. Each of its summaries
+    # A later review by the shape on terra reads from the head its last review read, when that head is an ancestor of
+    # this one, so it reads only what changed since; otherwise, or on Sol, it reads the whole pull request. Each of its summaries
     # names its label and head, and its round counts on from the last.
     - name: Find the review's round
       id: round
@@ -187,6 +190,7 @@ runs:
         NUMBER: ${{ steps.ask.outputs.number }}
         BASE: ${{ steps.ask.outputs.base }}
         HEAD: ${{ steps.ask.outputs.head }}
+        BATTERY_A: ${{ inputs.battery-a }}
       run: |
         set -euo pipefail
         repo="$GITHUB_WORKSPACE/rev-engine-prime-checkout"
@@ -199,7 +203,7 @@ runs:
         if [ -n "$last" ]; then
           label=$(awk '{print $3}' <<<"$last"); reviewed=$(awk '{print $4}' <<<"$last")
           round=$(( 10#${label##*-} + 1 ))
-          if [ "$reviewed" != "$HEAD" ] && git -C "$repo" merge-base --is-ancestor "$reviewed" "$HEAD" 2>/dev/null; then
+          if [ "${BATTERY_A:-}" != sol ] && [ "$reviewed" != "$HEAD" ] && git -C "$repo" merge-base --is-ancestor "$reviewed" "$HEAD" 2>/dev/null; then
             round_of="$label"; base="$reviewed"
             git -C "$repo" -c core.quotePath=false diff "$reviewed" "$HEAD" > "$RUNNER_TEMP/rev-engine-prime/pr/diff.patch"
           fi
@@ -263,8 +267,8 @@ runs:
       uses: actions/cache/restore@v4
       with:
         path: ${{ runner.temp }}/rev-engine-prime/kept
-        key: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}
-        restore-keys: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-
+        key: rev-engine-shape-${{ inputs.battery-a }}-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}
+        restore-keys: rev-engine-shape-${{ inputs.battery-a }}-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-
 
     # What a stopped review kept is sealed with the model key, since a pull request's own workflow can restore the
     # default branch's cache. Anything else restored, or a seal this key doesn't open, is set aside, and the review
@@ -335,7 +339,8 @@ runs:
         RB_HEAD: ${{ steps.ask.outputs.head }}
         RB_CONFIG_MODEL: ${{ inputs.model }}
         SHAPE: ${{ inputs.pipeline == 'shape' && 'on' || '' }}
-        RB_SOL_BASE_URL: ${{ inputs.sol-base-url }}
+        RB_RESPONSES_BASE_URL: ${{ inputs.responses-base-url }}
+        RB_SHAPE_BATTERY_A: ${{ inputs.battery-a }}
         RB_SHAPE_ROUND: ${{ steps.round.outputs.round }}
         RB_SHAPE_ROUND_OF: ${{ steps.round.outputs.round-of }}
         # Project rules are read from the pull request's base, never from an earlier head of the pull request itself.
@@ -353,7 +358,7 @@ runs:
         if [ -n "$SHAPE" ]; then
           export RB_MODEL_HEADERS
           RB_MODEL_HEADERS=$(jq -cn --arg tag "rev-engine/$RB_NWO#$RB_PR_NUMBER" '{"x-orca-class": "batch", "x-caller-tag": $tag}')
-          shape=(-e RB_CONFIG_SHAPE=on -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT -e RB_SOL_BASE_URL -e RB_SHAPE_ROUND -e RB_SHAPE_ROUND_OF -e RB_SHAPE_RULES_BASE -e RB_MODEL_HEADERS -e RB_SHAPE_OUT=/work/out/shape)
+          shape=(-e RB_CONFIG_SHAPE=on -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT -e RB_RESPONSES_BASE_URL -e RB_SHAPE_BATTERY_A -e RB_SHAPE_ROUND -e RB_SHAPE_ROUND_OF -e RB_SHAPE_RULES_BASE -e RB_MODEL_HEADERS -e RB_SHAPE_OUT=/work/out/shape)
           if [ -n "$KEPT" ]; then shape+=(-v "$RUNNER_TEMP/rev-engine-prime/kept:/work/kept:ro" -e RB_SHAPE_KEPT=/work/kept -e RB_SHAPE_RESUMED_FROM="$KEPT"); fi
         fi
         status=0
@@ -366,7 +371,7 @@ runs:
           -e RB_REPO=/work/repo -e RB_DIFF=/work/pr/diff.patch -e RB_PR_JSON=/work/pr/pr.json -e RB_PRIOR_JSON=/work/pr/prior.json \
           -e RB_OUT=/work/out/findings.json -e RB_ATTEMPT=1 \
           rev-engine-prime:action || status=$?
-        # Exit 3 is the review shape stopping with its answers kept: Sol couldn't take its calls, a call was
+        # Exit 3 is the review shape stopping with its answers kept: battery A's model couldn't take its calls, a call was
         # refused, or the job's time ran out. The steps below say so on the pull request.
         echo "status=$status" >> "$GITHUB_OUTPUT"
         if [ "$status" = 3 ]; then
@@ -381,7 +386,7 @@ runs:
 
     # Every stop but a refusal keeps the answers where GitHub lets the run write its cache, so a later run of the same
     # pull request at the same head goes on from them, whether a maintainer's /review starts it or a scheduled resume of
-    # one stopped for Sol or the time limit. GitHub lets a run started by pull_request_target or a comment restore the
+    # one stopped for an unavailable model or the time limit. GitHub lets a run started by pull_request_target or a comment restore the
     # default branch's cache but not write it (its cache access for low-trust triggers), so the Action keeps answers
     # only from a manual run: a stop of any other run keeps nothing new, and its first resume, a manual run, goes on
     # from what an earlier run kept, if any. So the event decides: the runner gives the access it grants
@@ -412,7 +417,7 @@ runs:
       uses: actions/cache/save@v4
       with:
         path: ${{ runner.temp }}/rev-engine-prime/kept
-        key: rev-engine-shape-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: rev-engine-shape-${{ inputs.battery-a }}-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     # The shape's run directories, for a record of the reviews, kept whether the review finished or stopped. They hold
     # what the review doesn't post, so they're saved sealed (action/seal.sh) before the review is posted: a save that
@@ -449,6 +454,7 @@ runs:
         REPO: ${{ github.repository }}
         NUMBER: ${{ steps.ask.outputs.number }}
         STOP: ${{ steps.review.outputs.stop }}
+        BATTERY_A: ${{ inputs.battery-a }}
         CATEGORY: ${{ steps.review.outputs.category }}
         KEPT: ${{ steps.gather.outputs.kept }}
         READONLY: ${{ steps.gather.outputs.readonly }}
@@ -479,7 +485,9 @@ runs:
         # another branch kept is that branch's.
         if [ "${KEPT:-}" = true ] && [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then kept="It asked GitHub's cache to keep what it has read (the run's log says if the cache refused), for as long as the cache holds it (up to a week unused), for a later manual run of this head on ${GITHUB_REF#refs/heads/}; a $COMMAND comment runs on the default branch, where what this run kept isn't, and goes on from what a run there kept, if any, or reads it from the start."; fi
         case "$STOP" in
-          sol-unavailable) body="This review stopped before it finished, because Sol, one of its two readers, couldn't take its calls. $kept" ;;
+          unavailable)
+            reader=Terra; if [ "${BATTERY_A:-}" = sol ]; then reader=Sol; fi
+            body="This review stopped before it finished, because $reader, one of its two readers, couldn't take its calls. $kept" ;;
           time) body="This review stopped at its own time limit, set inside the job's, before it finished. $kept" ;;
           refused) body="This review stopped: the model provider refused one of its calls (category: $CATEGORY). It won't go on by itself, and a $COMMAND comment may meet the same refusal." ;;
           *) body="This review stopped before it finished, and won't go on by itself. $kept" ;;
@@ -516,7 +524,7 @@ runs:
         REVIEW_MODEL: ${{ inputs.model }}
         MIN_SEVERITY: ${{ inputs.min-severity }}
         MAX_COMMENTS: ${{ inputs.max-findings }}
-        DEEP_COMMAND: ${{ inputs.deep-command }}
+        DEEP_COMMAND: ${{ (inputs.pipeline != 'shape' || inputs.battery-a != 'sol') && inputs.deep-command || '' }}
         EVENT_NAME: ${{ github.event_name }}
         OFF_LABEL: ${{ inputs.off-label }}
         COMMAND: ${{ inputs.command }}

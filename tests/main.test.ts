@@ -51,7 +51,7 @@ async function run(env: Record<string, string>, answer: Answer = TEXT_THEN_REFUS
     const child = spawn(process.execPath, [new URL("../src/main.ts", import.meta.url).pathname], {
       env: {
         PATH: process.env.PATH ?? "", HOME: root,
-        RB_MODEL_API: "anthropic", RB_MODEL_BASE_URL: url, RB_MODEL_API_KEY: "key", RB_SOL_BASE_URL: url,
+        RB_MODEL_API: "anthropic", RB_MODEL_BASE_URL: url, RB_MODEL_API_KEY: "key", RB_RESPONSES_BASE_URL: url,
         RB_NWO: "o/n", RB_PR_NUMBER: "1", RB_BASE: "a".repeat(40), RB_HEAD: "b".repeat(40),
         RB_REPO: join(root, "repo"), RB_DIFF: join(root, "pr", "diff.patch"), RB_PR_JSON: join(root, "pr", "pr.json"), RB_PRIOR_JSON: join(root, "pr", "prior.json"),
         RB_OUT: join(root, "out", "findings.json"), RB_ATTEMPT: "1",
@@ -88,13 +88,16 @@ test("the review shape's job log says only that it started and how it ended; eve
   assert.ok(lines.some((line) => line.startsWith("usage ")), "the usage of each caller");
   assert.ok(lines.some((line) => line.startsWith("review stopped (failed): ")), "the stop as the review records it");
   assert.doesNotMatch(stderr + trace.join("\n"), /PROVIDER-WORDS|MODEL-TEXT/, "a provider's words and the model's text reach neither");
-  const record = JSON.parse(readFileSync(join(root, "out", "shape", "run.json"), "utf8")) as { usage: Record<string, { calls: number }>; usageByModel: Record<string, { calls: number; cacheWriteTokens: number }> };
+  const record = JSON.parse(readFileSync(join(root, "out", "shape", "run.json"), "utf8")) as { usage: Record<string, { calls: number }>; usageByModel: Record<string, { calls: number; cacheWriteTokens: number }>; batteryA: string };
+  assert.equal(record.batteryA, "gpt-6.1-terra", "the record names battery A's model, terra unless told otherwise");
   const calls = (spent: Record<string, { calls: number }>) => Object.values(spent).reduce((sum, one) => sum + one.calls, 0);
   assert.ok(Object.keys(record.usageByModel).length > 0, "the run's record gives its usage by model");
   assert.equal(calls(record.usageByModel), calls(record.usage), "every call counted under its model, as under its caller");
   for (const [model, spent] of Object.entries(record.usageByModel)) {
-    assert.equal(spent.cacheWriteTokens, model === "gpt-6.1-sol" ? 0 : 3 * spent.calls, `${model}'s cache writes, apart, summed over its calls`);
+    assert.equal(spent.cacheWriteTokens, model === "gpt-6.1-sol" || model === "gpt-6.1-terra" ? 0 : 3 * spent.calls, `${model}'s cache writes, apart, summed over its calls`);
   }
+  const deep = await run({ RB_CONFIG_SHAPE: "on", RB_SHAPE_OUT: "", RB_SHAPE_BATTERY_A: "sol" });
+  assert.equal((JSON.parse(readFileSync(join(deep.root, "out", "shape", "run.json"), "utf8")) as { batteryA: string }).batteryA, "gpt-6.1-sol");
 });
 
 test("the reader's lines all go to the job's log, and it writes no trace", { timeout: 120_000 }, async () => {
@@ -115,6 +118,22 @@ test("a finished review shape says on the job's log what the pull request sees, 
   assert.match(trace, / plan: 1 area\(s\), 1 task\(s\) and question\(s\), 0 fact\(s\)\n/);
   assert.match(trace, / 0 finding\(s\) written by the review shape; \d+ model call\(s\), \d+s\n/);
   assert.doesNotMatch(stderr + trace, /PROVIDER-WORDS|MODEL-TEXT/);
+});
+
+test("battery A asks terra at xhigh unless told sol, and then Sol at xhigh", { timeout: 240_000 }, async () => {
+  for (const [setting, model] of [["", "gpt-6.1-terra"], ["sol", "gpt-6.1-sol"]] as const) {
+    const asked = new Set<string>();
+    const recording: Answer = (body, n) => {
+      if (body.includes('"input"')) {
+        const request = JSON.parse(body) as { model: string; reasoning?: { effort?: string } };
+        asked.add(`${request.model} ${request.reasoning?.effort}`);
+      }
+      return NO_FINDINGS(body, n);
+    };
+    const { code, stderr } = await run({ RB_CONFIG_SHAPE: "on", ...(setting ? { RB_SHAPE_BATTERY_A: setting } : {}) }, recording);
+    assert.equal(code, 0, stderr);
+    assert.deepEqual([...asked], [`${model} xhigh`], setting || "by default");
+  }
 });
 
 test("a trace that can't be written is said once on the job's log, and the review goes on without it", { timeout: 120_000 }, async () => {

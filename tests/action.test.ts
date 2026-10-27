@@ -68,6 +68,11 @@ function stub(temp: string, name: string, script: string): void {
   chmodSync(join(temp, "bin", name), 0o755);
 }
 
+/** Asserts that a step of the Action (or the given file) holds this line, as written. */
+function bound(step: string, line: string, source = ACTION): void {
+  assert.ok(stepBlock(step, source).split("\n").some((each) => each.trim() === line), `${step}: ${line}`);
+}
+
 /** Opens a seal with a model key, as INSTALL.md's command does, and returns the files it holds. */
 function openSealed(file: string, key: string): Record<string, string> {
   return sealedFiles(`openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -pass env:MODEL_API_KEY -in "${file}"`, { MODEL_API_KEY: key });
@@ -149,6 +154,18 @@ test("the round is read from a bot summary's own marker line only, in base 10", 
   assert.equal(runStep("Find the review's round", env, reviews([summary(`quoted ${marker} in a line`)])).outputs.round, "1", "a marker inside a longer line isn't one");
   assert.equal(runStep("Find the review's round", env, reviews([`review text\n${marker}\nmore\n<!-- rev-engine-prime -->`])).outputs.round, "1", "only a summary's last line but one is its marker");
   assert.equal(runStep("Find the review's round", env, reviews([`human:${summary(marker)}`])).outputs.round, "1", "a person's review isn't a summary");
+  const workspace = mkdtempSync(join(tmpdir(), "action-round-"));
+  const checkout = join(workspace, "rev-engine-prime-checkout");
+  const git = (...args: string[]) => execFileSync("git", ["-C", checkout, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { encoding: "utf8" }).trim();
+  mkdirSync(checkout);
+  git("init", "-q");
+  const tree = git("hash-object", "-t", "tree", "-w", "/dev/null");
+  const earlier = git("commit-tree", tree, "-m", "earlier");
+  const later = git("commit-tree", tree, "-p", earlier, "-m", "later");
+  const since = { ...env, HEAD: later, GITHUB_WORKSPACE: workspace };
+  const earlierReview = reviews([summary(`<!-- rev-engine-shape-review re-o.r-7-08 ${earlier} -->`)]);
+  assert.deepEqual(runStep("Find the review's round", { ...since, BATTERY_A: "terra" }, earlierReview).outputs, { round: "9", "round-of": "re-o.r-7-08", base: earlier }, "on terra, only what changed since");
+  assert.deepEqual(runStep("Find the review's round", { ...since, BATTERY_A: "sol" }, earlierReview).outputs, { round: "9", "round-of": "", base: "b".repeat(40) }, "on Sol, the whole pull request, whichever battery read the last review");
 });
 
 test("the shape's container gets the run's id and attempt for its record", () => {
@@ -193,7 +210,9 @@ test("the stop comment says what was kept, and why not when GitHub's cache was t
     return readFileSync(body, "utf8");
   };
   // actions/cache's save warns and succeeds when the cache refuses it, so what was kept is said as asked of the cache, with where to look.
-  assert.match(said({ STOP: "sol-unavailable", KEPT: "true" }), /It asked GitHub's cache to keep what it has read \(the run's log says if the cache refused\)/);
+  assert.match(said({ STOP: "unavailable", KEPT: "true" }), /It asked GitHub's cache to keep what it has read \(the run's log says if the cache refused\)/);
+  assert.match(said({ STOP: "unavailable", BATTERY_A: "terra" }), /^This review stopped before it finished, because Terra, one of its two readers, couldn't take its calls\. /);
+  assert.match(said({ STOP: "unavailable", BATTERY_A: "sol", COMMAND: "/review deep" }), /^This review stopped before it finished, because Sol, one of its two readers, couldn't take its calls\. A later run of this head from the same base, which a \/review deep comment/);
   assert.match(said({ STOP: "time", READONLY: "true" }), /This run kept nothing for a later run to go on from: only a manual run keeps a stopped review's answers\./);
   assert.doesNotMatch(said({ STOP: "time" }), /GitHub's cache|kept nothing/, "nothing to keep is no cache's doing");
   // The command the caller configured, wherever the notice names one.
@@ -202,7 +221,7 @@ test("the stop comment says what was kept, and why not when GitHub's cache was t
   assert.doesNotMatch(configured, /\/review/);
   assert.match(said({ STOP: "refused", CATEGORY: "cyber_policy", COMMAND: "/check" }), /a \/check comment may meet the same refusal/);
   assert.match(said({ STOP: "time", COMMAND: "/check" }), /which a \/check comment from someone with write access starts, goes on from what an earlier run of it kept/, "and with nothing kept");
-  assert.match(said({ STOP: "sol-unavailable", KEPT: "true", GITHUB_REF: "refs/heads/dev" }), /a later manual run of this head on dev; a \/review comment runs on the default branch, where what this run kept isn't, and goes on from what a run there kept, if any, or reads it from the start\./);
+  assert.match(said({ STOP: "unavailable", KEPT: "true", GITHUB_REF: "refs/heads/dev" }), /a later manual run of this head on dev; a \/review comment runs on the default branch, where what this run kept isn't, and goes on from what a run there kept, if any, or reads it from the start\./);
   assert.match(said({ STOP: "refused", CATEGORY: "cyber_policy" }), /refused one of its calls \(category: cyber_policy\)\. It won't go on by itself, and a \/review comment may meet the same refusal\./);
   assert.ok(said({ STOP: "time" }).endsWith("The run: https://x/run\n\n<!-- rev-engine-prime -->"), "the marker tells a later review it's this Action's own post");
   // The off label put on meanwhile keeps the notice off the thread, as it keeps the review, unless a comment asked.
@@ -444,14 +463,21 @@ test("what a stopped review kept opens with the model key, and anything else res
 });
 
 test("each value a step reads is bound from the input or variable it stands for", () => {
-  const bound = (step: string, line: string, source = ACTION) => assert.ok(stepBlock(step, source).split("\n").some((each) => each.trim() === line), `${step}: ${line}`);
   bound("Check who asked", "OFF_LABEL: ${{ inputs.off-label }}");
   bound("Check who asked", "MODEL_API_KEY: ${{ inputs.model-api-key }}");
   bound("Check who asked", "COMMENT: ${{ github.event.comment.body }}", WORKFLOW);
   bound("Check who asked", "NUMBER: ${{ github.event.issue.number }}", WORKFLOW);
   bound("Check who asked", "RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", WORKFLOW);
   bound("Check who asked", "DEFAULT_PIPELINE: ${{ vars.REVIEW_PIPELINE }}", WORKFLOW);
-  bound("Post the review", "DEEP_COMMAND: ${{ inputs.deep-command }}");
+  bound("Post the review", "DEEP_COMMAND: ${{ (inputs.pipeline != 'shape' || inputs.battery-a != 'sol') && inputs.deep-command || '' }}");
+  bound("Say that the review stopped", "BATTERY_A: ${{ inputs.battery-a }}");
+  bound("Review", "RB_SHAPE_BATTERY_A: ${{ inputs.battery-a }}");
+  bound("Review", "RB_RESPONSES_BASE_URL: ${{ inputs.responses-base-url }}");
+  assert.match(stepScript("Review"), /-e RB_RESPONSES_BASE_URL -e RB_SHAPE_BATTERY_A /, "the review's container is given both");
+  bound("Check who asked", "AUTHOR: ${{ github.event.pull_request.user.login }}", WORKFLOW);
+  bound("Check who asked", "SKIP_AUTHORS: ${{ vars.REVIEW_SKIP_AUTHORS }}", WORKFLOW);
+  bound("Review", "responses-base-url: ${{ vars.RESPONSES_BASE_URL }}", WORKFLOW);
+  bound("Review", "battery-a: ${{ needs.who.outputs.battery-a }}", WORKFLOW);
   bound("Post the review", "OFF_LABEL: ${{ inputs.off-label }}");
   bound("Say that the review stopped", "OFF_LABEL: ${{ inputs.off-label }}");
   bound("Say that the review stopped", "EVENT_NAME: ${{ github.event_name }}");
@@ -499,24 +525,58 @@ test("the shared workflow reviews a write-access /review deep comment with the s
   const ask = (event: string, comment: string, defaultPipeline = "", permission = "write", commands = { REVIEW_COMMAND: plain!, DEEP_COMMAND: deep! }) => runStep("Check who asked", {
     EVENT_NAME: event, COMMENT: comment, DEFAULT_PIPELINE: defaultPipeline, ...commands, REPO: "o/r", ACTOR: "someone", GH_TOKEN: "t",
   }, (temp) => stub(temp, "gh", `echo ${permission}`), { source: WORKFLOW }).outputs;
-  assert.deepEqual(ask("issue_comment", "/review deep"), { pipeline: "shape", command: "/review deep", allowed: "true" });
-  assert.deepEqual(ask("issue_comment", "/review deep please, the auth part"), { pipeline: "shape", command: "/review deep", allowed: "true" });
-  assert.deepEqual(ask("issue_comment", "/review deep\r\nThe auth part, please."), { pipeline: "shape", command: "/review deep", allowed: "true" }, "a note on the next line, as GitHub's editor sends it");
-  assert.deepEqual(ask("issue_comment", "/review"), { pipeline: "reader", command: "/review", allowed: "true" });
-  assert.deepEqual(ask("issue_comment", "/review deeper"), { pipeline: "reader", command: "/review", allowed: "true" }, "only the word itself");
-  assert.deepEqual(ask("issue_comment", "/review\r\nThe auth part, please."), { pipeline: "reader", command: "/review", allowed: "true" }, "a line break after the command, as after the deep one");
+  assert.deepEqual(ask("issue_comment", "/review deep"), { pipeline: "shape", command: "/review deep", "battery-a": "sol", allowed: "true" });
+  assert.deepEqual(ask("issue_comment", "/review deep please, the auth part"), { pipeline: "shape", command: "/review deep", "battery-a": "sol", allowed: "true" });
+  assert.deepEqual(ask("issue_comment", "/review deep\r\nThe auth part, please."), { pipeline: "shape", command: "/review deep", "battery-a": "sol", allowed: "true" }, "a note on the next line, as GitHub's editor sends it");
+  assert.deepEqual(ask("issue_comment", "/review"), { pipeline: "reader", command: "/review", "battery-a": "terra", allowed: "true" });
+  assert.deepEqual(ask("issue_comment", "/review deeper"), { pipeline: "reader", command: "/review", "battery-a": "terra", allowed: "true" }, "only the word itself");
+  assert.deepEqual(ask("issue_comment", "/review\r\nThe auth part, please."), { pipeline: "reader", command: "/review", "battery-a": "terra", allowed: "true" }, "a line break after the command, as after the deep one");
   assert.deepEqual(ask("issue_comment", "/reviewer, could you look?"), {}, "a comment that only begins like the command asks for nothing");
   assert.match(failedOutput(() => ask("issue_comment", "/review deep", "", "write", { REVIEW_COMMAND: plain!, DEEP_COMMAND: "" })), /::error::The workflow's REVIEW_COMMAND or DEEP_COMMAND is empty/, "an empty command fails rather than taking a deep request as the reader's");
-  assert.deepEqual(ask("issue_comment", "/review the deep parts"), { pipeline: "reader", command: "/review", allowed: "true" });
-  assert.deepEqual(ask("issue_comment", "/review", "shape"), { pipeline: "shape", command: "/review", allowed: "true" }, "where the shape is the default");
-  assert.deepEqual(ask("pull_request_target", ""), { pipeline: "reader", command: "/review", allowed: "true" });
-  assert.deepEqual(ask("pull_request_target", "", "shape"), { pipeline: "shape", command: "/review", allowed: "true" });
-  assert.deepEqual(ask("workflow_dispatch", ""), { pipeline: "reader", command: "/review", allowed: "true" }, "a manual run is the default's");
+  assert.deepEqual(ask("issue_comment", "/review the deep parts"), { pipeline: "reader", command: "/review", "battery-a": "terra", allowed: "true" });
+  assert.deepEqual(ask("issue_comment", "/review", "shape"), { pipeline: "shape", command: "/review", "battery-a": "terra", allowed: "true" }, "where the shape is the default");
+  assert.deepEqual(ask("pull_request_target", ""), { pipeline: "reader", command: "/review", "battery-a": "terra", allowed: "true" });
+  assert.deepEqual(ask("pull_request_target", "", "shape"), { pipeline: "shape", command: "/review", "battery-a": "terra", allowed: "true" });
+  assert.deepEqual(ask("workflow_dispatch", ""), { pipeline: "reader", command: "/review", "battery-a": "terra", allowed: "true" }, "a manual run is the default's");
   assert.equal(ask("issue_comment", "/review deep", "", "read").allowed, undefined, "and asks write access, as /review does");
   assert.equal(ask("issue_comment", "/review deep", "", "triage").allowed, undefined);
 });
 
-test("a write-access /review deep comment is answered as the run starts, and no other request is", () => {
+test("a pull request opened by an author the caller lists isn't reviewed at open, and a comment or a manual run still reviews it", () => {
+  const ask = (event: string, author: string, skip: string, comment = "") => runStep("Check who asked", {
+    EVENT_NAME: event, COMMENT: comment, DEFAULT_PIPELINE: "shape", REVIEW_COMMAND: "/review", DEEP_COMMAND: "/review deep", REPO: "o/r", ACTOR: "someone", GH_TOKEN: "t",
+    AUTHOR: author, SKIP_AUTHORS: skip,
+  }, (temp) => {
+    stub(temp, "gh", "echo write");
+    // A file a careless glob of the list would expand to, in the step's working directory.
+    mkdirSync(join(temp, "work"), { recursive: true });
+    writeFileSync(join(temp, "work", "build-bott"), "");
+  }, { source: WORKFLOW, cwd: "work" });
+  const skip = "octo-dev build-bot[bot]";
+  const skipped = ask("pull_request_target", "build-bot[bot]", skip);
+  assert.equal(skipped.outputs.allowed, undefined, "a login with brackets matches itself, whatever the directory holds");
+  assert.match(skipped.stdout, /::notice::No review: pull requests build-bot\[bot\] opens aren't reviewed when opened, reopened or marked ready \(REVIEW_SKIP_AUTHORS\); a \/review comment reviews one/);
+  assert.equal(ask("pull_request_target", "octo-dev", skip).outputs.allowed, undefined);
+  assert.equal(ask("pull_request_target", "build-bot[bot]", "  octo-dev\nbuild-bot[bot]\n").outputs.allowed, undefined, "spaces and line breaks separate the list's words");
+  assert.equal(ask("pull_request_target", "build-bot[bot]", "build-bot[bot]\r\nocto-dev").outputs.allowed, undefined, "a line break as a browser's form sends it");
+  assert.equal(ask("pull_request_target", "Octo-Dev", skip).outputs.allowed, undefined, "in any case, as GitHub's logins are");
+  assert.equal(ask("pull_request_target", "octo-dev", "Octo-Dev").outputs.allowed, undefined, "a list written in another case too");
+  assert.equal(ask("pull_request_target", "xocto-dev", skip).outputs.allowed, "true", "a login that only contains a listed one");
+  assert.equal(ask("pull_request_target", "octo", skip).outputs.allowed, "true", "or is contained in one");
+  assert.equal(ask("pull_request_target", "build-bott", skip).outputs.allowed, "true", "or matches a listed one as a glob");
+  assert.equal(ask("pull_request_target", "someone", "").outputs.allowed, "true", "an empty list skips no one");
+  assert.equal(ask("issue_comment", "octo-dev", skip, "/review").outputs.allowed, "true", "a /review comment on a listed author's pull request");
+  assert.equal(ask("workflow_dispatch", "", skip).outputs.allowed, "true", "a manual run");
+});
+
+test("a deep review and a review on terra queue together and keep their stopped answers apart", () => {
+  assert.ok(WORKFLOW.includes("\n      group: rev-engine-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr-number }}-${{ needs.who.outputs.pipeline }}\n"), "one group whatever battery A, so each counts its round on from the other's");
+  bound("Restore a stopped review's answers", "key: rev-engine-shape-${{ inputs.battery-a }}-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}");
+  bound("Restore a stopped review's answers", "restore-keys: rev-engine-shape-${{ inputs.battery-a }}-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-");
+  bound("Keep a stopped review's answers", "key: rev-engine-shape-${{ inputs.battery-a }}-${{ steps.ask.outputs.number }}-${{ steps.ask.outputs.head }}-${{ steps.round.outputs.base }}-${{ github.run_id }}-${{ github.run_attempt }}");
+});
+
+test("a write-access /review deep comment is answered as the run starts, and so is a /review the shape reviews, and no other request is", () => {
   const ask = (event: string, comment: string, options: { permission?: string; answer?: number; defaultPipeline?: string } = {}) => {
     const run = runStep("Check who asked", {
       EVENT_NAME: event, COMMENT: comment, NUMBER: "7", RUN: "https://github.com/o/r/actions/runs/9", DEFAULT_PIPELINE: options.defaultPipeline ?? "", REVIEW_COMMAND: "/review", DEEP_COMMAND: "/review deep", REPO: "o/r", ACTOR: "someone", GH_TOKEN: "t",
@@ -529,14 +589,17 @@ test("a write-access /review deep comment is answered as the run starts, and no 
     "pr", "comment", "7", "--repo", "o/r", "--body",
     "A deep review of this pull request has been requested. It usually takes less than 30 minutes, though it may first wait for an earlier review of this pull request to finish. When it finishes, the review is posted on this pull request.\n\nThe run: https://github.com/o/r/actions/runs/9\n\n<!-- rev-engine-prime -->",
   ], "the answer carries the marker that tells the workflow's own posts from others' when a later review reads the thread");
-  assert.deepEqual(deep.outputs, { pipeline: "shape", command: "/review deep", allowed: "true" });
+  assert.deepEqual(deep.outputs, { pipeline: "shape", command: "/review deep", "battery-a": "sol", allowed: "true" });
   assert.deepEqual(ask("issue_comment", "/review").answered, [], "a plain /review");
-  assert.deepEqual(ask("issue_comment", "/review", { defaultPipeline: "shape" }).answered, [], "a plain /review where the shape is the default");
+  assert.deepEqual(ask("issue_comment", "/review\r\nThe auth part, please.", { defaultPipeline: "shape" }).answered, [
+    "pr", "comment", "7", "--repo", "o/r", "--body",
+    "A review of this pull request has been requested. It may first wait for an earlier review of this pull request to finish. When the requested review finishes, it's posted on this pull request.\n\nThe run: https://github.com/o/r/actions/runs/9\n\n<!-- rev-engine-prime -->",
+  ], "a plain /review where the shape is the default, which reads with battery A on terra");
   assert.deepEqual(ask("issue_comment", "/review deep", { permission: "read" }).answered, [], "a comment from someone without write access, which runs nothing");
   assert.deepEqual(ask("pull_request_target", "").answered, []);
   assert.deepEqual(ask("workflow_dispatch", "").answered, []);
   const refused = ask("issue_comment", "/review deep", { answer: 1 });
-  assert.deepEqual(refused.outputs, { pipeline: "shape", command: "/review deep", allowed: "true" }, "an answer GitHub refuses doesn't stop the review");
+  assert.deepEqual(refused.outputs, { pipeline: "shape", command: "/review deep", "battery-a": "sol", allowed: "true" }, "an answer GitHub refuses doesn't stop the review");
   assert.match(refused.stdout, /::warning::Could not answer the \/review deep comment; the review goes on/);
 });
 

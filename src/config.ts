@@ -44,8 +44,8 @@ export interface Config extends Endpoint {
   /** Replace the review with the swarm prototype in experiments/prototypes/swarm, which reads its own RB_CONFIG_SWARM_* settings. */
   swarm: boolean;
   /**
-   * Replace the review with the review shape in src/shape: a planner, two batteries (Sol and haiku), a grouper, a
-   * judge and a severity check. Null when off.
+   * Replace the review with the review shape in src/shape: a planner, two batteries (terra or Sol, and haiku), a
+   * grouper, a judge and a severity check. Null when off.
    */
   shape: ShapeSettings | null;
   /** Findings less severe than this are dropped before verification. */
@@ -66,10 +66,14 @@ export interface Config extends Endpoint {
   maxTurns: number;
 }
 
+export type BatteryAModel = "terra" | "sol";
+
 /** The review shape's settings (docs/SETTINGS.md). */
 export interface ShapeSettings {
-  /** Where Sol is asked, an OpenAI Responses endpoint, with the same key as the main endpoint. */
-  solBaseUrl: string;
+  /** Where battery A's model is asked, an OpenAI Responses endpoint, with the same key as the main endpoint. */
+  responsesBaseUrl: string;
+  /** Battery A's model: terra or Sol. */
+  batteryA: BatteryAModel;
   /** The directory each area's run directory is written under. */
   outDir: string;
   /** An earlier run's output directory of the same review, whose plan and answers are taken instead of asked again. */
@@ -226,8 +230,11 @@ export function loadConfig(env: Env): Config {
   if (shapeOn === "on") {
     if (endpoint.api !== "anthropic") throw new Error("RB_CONFIG_SHAPE=on asks its Claude models through Anthropic Messages, so RB_MODEL_API must be anthropic");
     const round = integer(env, "RB_SHAPE_ROUND", 1, 1, 10_000);
+    const batteryA = env.RB_SHAPE_BATTERY_A || "terra";
+    if (batteryA !== "terra" && batteryA !== "sol") throw new Error("RB_SHAPE_BATTERY_A must be terra or sol");
     shape = {
-      solBaseUrl: required(env, "RB_SOL_BASE_URL").replace(/\/+$/, ""),
+      responsesBaseUrl: required(env, "RB_RESPONSES_BASE_URL").replace(/\/+$/, ""),
+      batteryA,
       outDir: env.RB_SHAPE_OUT?.trim() || join(dirname(outPath), "shape"),
       keptDir: env.RB_SHAPE_KEPT?.trim() || null,
       round,
@@ -277,7 +284,7 @@ export function loadConfig(env: Env): Config {
 /** The settings line the benchmark looks for: every configured label value must appear in the output. */
 export function describeSettings(config: Config): string {
   if (config.naive) return `naive=on model=${config.models[0]} max_findings=${config.maxFindings} time_budget=${config.budgetMs / 1000}`;
-  if (config.shape) return `shape=on model=${config.models[0]} label=${config.shape.label} rules_base=${config.shape.rulesBase.slice(0, 12)}${config.shape.keptDir ? " kept=on" : ""}`;
+  if (config.shape) return `shape=on model=${config.models[0]} battery_a=${config.shape.batteryA} label=${config.shape.label} rules_base=${config.shape.rulesBase.slice(0, 12)}${config.shape.keptDir ? " kept=on" : ""}`;
   if (config.swarm) return `swarm=on model=${config.models[0]} verifier=${config.verifierModel} verify=${config.verify} effort=${config.effort ?? "default"} max_findings=${config.maxFindings} time_budget=${config.budgetMs / 1000} max_turns=${config.maxTurns}`;
   return [
     `model=${config.models.map((model, index) => (config.focuses[index] ? `${model}@${config.focuses[index]}` : model)).join(",")}`,
