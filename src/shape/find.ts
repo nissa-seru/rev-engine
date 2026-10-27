@@ -11,7 +11,7 @@ import { changeTextTool, readTools, safeRelativePath, type ChangeTexts, type Rea
 import { entryHunks, entryOf, HAND_IN_TURNS, KINDS, SEVERITIES, type Finding, type Hunk, type Kind, type Place, type Severity } from "./types.ts";
 import type { Lens, Task } from "./plan.ts";
 
-export const FIND_SOURCE = { name: "workflow:review-find", blob: "24eb3cee02d9af99745f8e3c898879417deae72a" };
+export const FIND_SOURCE = { name: "workflow:review-find", blob: "60c0f6a769e451edb1cf2174ed7a895f7733c7fb" };
 
 /** The change's own text, which a finding may cite as a place. Finders read both with read_change_text, and their brief gives each one's length. */
 export const TEXT_FILES = ["change-text.md", "commit-messages.txt"];
